@@ -1,0 +1,82 @@
+config-version: 1
+
+storage:
+  # sqlite or postgresql. Existing installations remain on SQLite.
+  backend: sqlite
+  # Writes are owned by one DB thread. Larger batches reduce PostgreSQL round trips
+  # but keep more records in memory until a flush/query/shutdown boundary.
+  queue-capacity: 50000
+  batch-size: 512
+  flush-interval-ms: 50
+  sqlite:
+    file: history.db
+    busy-timeout-ms: 5000
+  postgresql:
+    host: 127.0.0.1
+    port: 5432
+    database: history
+    schema: history
+    username: history
+    # Prefer password-env in production so secrets are not stored in this file.
+    password-env: HISTORY_PG_PASSWORD
+    password: ''
+    ssl-mode: require
+    connect-timeout-ms: 5000
+    socket-timeout-seconds: 30
+  retention:
+    # 0 keeps records indefinitely. Positive values purge in bounded batches and
+    # reclaim state payloads once no retained change/operation references them.
+    days: 0
+    purge-batch-size: 10000
+    maintenance-interval-minutes: 60
+
+logging:
+  player-blocks: true
+  explosions: true
+  natural-changes: true
+  pistons: true
+  liquids: true
+  # Uses the public WorldEdit EditSession/Extent API and also supports FAWE.
+  worldedit: true
+  player-interactions: true
+  containers: true
+  signs: true
+  player-sessions: true
+  player-commands: true
+  # Chat contains personal content, so it remains opt-in.
+  player-messages: false
+  items: true
+  entities: true
+  redacted-command-prefixes:
+    - login
+    - register
+    - changepassword
+    - 2fa
+    - totp
+
+inspection:
+  result-limit: 8
+  nearby-radius: 10
+
+rollback:
+  default-duration: 15m
+  default-radius: 10
+  # Large spatial queries remain bounded by max-source-changes and exact chunk
+  # count; raising this does not cause every chunk inside the circle to load.
+  max-radius: 10000
+  max-source-changes: 10000
+  # Hard containment boundary over exact chunks referenced by recorded changes.
+  # Unloaded and distant chunks inside this bound are restored; no surrounding
+  # cuboid or WorldEdit/FAWE restore operation is ever requested.
+  max-chunks-per-operation: 256
+  # Global pressure bound across simultaneous History operations. This limits
+  # both in-flight loads and chunks currently held by a History ticket.
+  max-concurrent-chunk-leases: 4
+  chunk-load-timeout-seconds: 30
+  # A recorded target normally already exists. If its region was pruned after
+  # recording, allow Paper to regenerate that exact chunk before restoration.
+  generate-missing-chunks: true
+  blocks-per-tick: 250
+  preview-ttl-seconds: 120
+  # Disabled until dropped/picked-up item reconciliation is implemented.
+  restore-block-entity-data: false

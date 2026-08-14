@@ -1,0 +1,47 @@
+name: History
+version: '${version}'
+main: kr.playcity.history.HistoryPlugin
+api-version: '26.2'
+load: POSTWORLD
+authors: ['PLAYCITY BLOCK']
+description: Fast, safe, and guided world history for Paper.
+prefix: History
+website: https://playcity.kr
+softdepend: [WorldEdit, FastAsyncWorldEdit]
+
+commands:
+  history:
+    description: Open History's guided inspection and rollback controls
+    usage: /history
+    aliases: [hist]
+    permission: history.use
+
+permissions:
+  history.use:
+    description: Open the History dashboard
+    default: op
+  history.inspect:
+    description: Inspect block history in the world
+    default: op
+  history.lookup:
+    description: Search nearby block history
+    default: op
+  history.rollback:
+    description: Preview and apply a rollback
+    default: op
+  history.undo:
+    description: Reverse a History rollback operation
+    default: op
+  history.status:
+    description: View History storage health and capacity diagnostics
+    default: op
+  history.admin:
+    description: Grant all History capabilities
+    default: op
+    children:
+      history.use: true
+      history.inspect: true
+      history.lookup: true
+      history.rollback: true
+      history.undo: true
+      history.status: true

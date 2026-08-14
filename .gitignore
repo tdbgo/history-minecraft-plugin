@@ -1,0 +1,22 @@
+.gradle/
+build/
+out/
+.idea/
+.vscode/
+.settings/
+.classpath
+.project
+*.iml
+*.log
+.env
+.env.*
+hs_err_pid*
+
+# Runtime data and local smoke-test worlds
+run/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
