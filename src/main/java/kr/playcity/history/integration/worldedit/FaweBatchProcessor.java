@@ -11,7 +11,6 @@ import kr.playcity.history.capture.ChangeRecorder;
 import kr.playcity.history.model.ActorRef;
 import kr.playcity.history.model.BlockPosition;
 import kr.playcity.history.model.BlockSnapshot;
-import kr.playcity.history.model.ChangeCause;
 
 import java.util.Map;
 import java.util.Objects;
@@ -60,6 +59,7 @@ final class FaweBatchProcessor implements IBatchProcessor {
                     failure
                 );
             }
+            throw failure;
         }
         return set;
     }
@@ -90,15 +90,18 @@ final class FaweBatchProcessor implements IBatchProcessor {
                         if (before == after || before.equals(after)) {
                             continue;
                         }
-                        recorder.recordBatchChange(
+                        boolean accepted = recorder.recordFaweBatchChange(
                             new BlockPosition(worldId, baseX + localX, y, baseZ + localZ),
                             actor,
-                            ChangeCause.WORLD_EDIT,
                             BlockSnapshot.block(stateString(before)),
                             BlockSnapshot.block(stateString(after)),
-                            batchId,
-                            ""
+                            batchId
                         );
+                        if (!accepted) {
+                            throw new IllegalStateException(
+                                "History storage could not admit a FAWE change before chunk application"
+                            );
+                        }
                     }
                 }
             }
@@ -107,13 +110,9 @@ final class FaweBatchProcessor implements IBatchProcessor {
 
     @Override
     public Extent construct(Extent child) {
-        return new WorldEditChangeExtent(
-            child,
-            worldId,
-            actor,
-            batchId,
-            recorder
-        );
+        // processSet observes the complete FAWE chunk. Wrapping the extent as
+        // well records the same mutation twice and doubles ingress pressure.
+        return child;
     }
 
     private String stateString(BlockState state) {

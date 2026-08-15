@@ -28,7 +28,8 @@ import java.util.logging.Logger;
 public final class AsyncHistoryStore implements HistoryStore {
     private final HistoryConfig.Storage config;
     private final Logger logger;
-    private final ArrayBlockingQueue<ChangeRecord> queue;
+    private final ArrayBlockingQueue<ChangeRecord> directQueue;
+    private final ArrayBlockingQueue<ChangeRecord> worldEditQueue;
     private final ExecutorService databaseExecutor;
     private final ScheduledExecutorService flushTimer;
     private final HistoryRepository repository;
@@ -49,11 +50,15 @@ public final class AsyncHistoryStore implements HistoryStore {
     private final AtomicReference<String> lastError = new AtomicReference<>("");
     private final AtomicReference<CompletableFuture<Void>> closeFuture = new AtomicReference<>();
     private final CompletableFuture<Void> readyFuture;
+    private boolean preferWorldEdit = true;
 
     public AsyncHistoryStore(HistoryConfig.Storage config, Logger logger) {
         this.config = config;
         this.logger = logger;
-        this.queue = new ArrayBlockingQueue<>(config.queueCapacity());
+        // Each lane receives the configured headroom. FAWE can no longer consume
+        // the capacity required by direct player and server changes.
+        this.directQueue = new ArrayBlockingQueue<>(config.queueCapacity());
+        this.worldEditQueue = new ArrayBlockingQueue<>(config.queueCapacity());
         this.databaseExecutor = Executors.newSingleThreadExecutor(
             Thread.ofPlatform().name("History-Database").factory()
         );
@@ -95,7 +100,7 @@ public final class AsyncHistoryStore implements HistoryStore {
             rejected.incrementAndGet();
             return false;
         }
-        boolean offered = queue.offer(change);
+        boolean offered = directQueue.offer(change);
         if (!offered) {
             rejected.incrementAndGet();
             healthy.set(false);
@@ -105,10 +110,34 @@ public final class AsyncHistoryStore implements HistoryStore {
             return false;
         }
         accepted.incrementAndGet();
-        if (queue.size() >= config.batchSize()) {
+        if (directQueue.size() >= config.batchSize()) {
             requestFlush();
         }
         return true;
+    }
+
+    @Override
+    public boolean appendWorldEdit(ChangeRecord change) {
+        if (!accepting.get() || !healthy.get()) {
+            rejected.incrementAndGet();
+            return false;
+        }
+        try {
+            while (accepting.get() && healthy.get()) {
+                if (worldEditQueue.offer(change, 250, TimeUnit.MILLISECONDS)) {
+                    accepted.incrementAndGet();
+                    if (worldEditQueue.size() >= config.batchSize()) {
+                        requestFlush();
+                    }
+                    return true;
+                }
+                requestFlush();
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        rejected.incrementAndGet();
+        return false;
     }
 
     @Override
@@ -179,7 +208,7 @@ public final class AsyncHistoryStore implements HistoryStore {
             ready.get(),
             accepting.get(),
             healthy.get(),
-            queue.size() + retrySize.get(),
+            directQueue.size() + worldEditQueue.size() + retrySize.get(),
             accepted.get(),
             persisted.get(),
             compacted.get(),
@@ -218,13 +247,13 @@ public final class AsyncHistoryStore implements HistoryStore {
     }
 
     private void requestFlush() {
-        if ((!queue.isEmpty() || retrySize.get() > 0) && flushScheduled.compareAndSet(false, true)) {
+        if (hasPendingWrites() && flushScheduled.compareAndSet(false, true)) {
             readyFuture.thenRunAsync(this::flushOneBatchOnDatabaseThread, databaseExecutor)
                 .whenComplete((unused, failure) -> {
                     flushScheduled.set(false);
                     if (failure != null) {
                         markFailure(failure);
-                    } else if (queue.size() >= config.batchSize()) {
+                    } else if (!worldEditQueue.isEmpty() || directQueue.size() >= config.batchSize()) {
                         requestFlush();
                     }
                 });
@@ -250,7 +279,7 @@ public final class AsyncHistoryStore implements HistoryStore {
     }
 
     private void flushAllOnDatabaseThread() {
-        while (!queue.isEmpty() || !retryBatch.isEmpty()) {
+        while (hasPendingWrites()) {
             flushOneBatchOnDatabaseThread();
         }
     }
@@ -261,8 +290,12 @@ public final class AsyncHistoryStore implements HistoryStore {
             batch.addAll(retryBatch);
             retryBatch.clear();
             retrySize.set(0);
+        } else if ((preferWorldEdit && !worldEditQueue.isEmpty()) || directQueue.isEmpty()) {
+            worldEditQueue.drainTo(batch, config.batchSize());
+            preferWorldEdit = false;
         } else {
-            queue.drainTo(batch, config.batchSize());
+            directQueue.drainTo(batch, config.batchSize());
+            preferWorldEdit = true;
         }
         if (batch.isEmpty()) {
             return;
@@ -280,6 +313,10 @@ public final class AsyncHistoryStore implements HistoryStore {
             retrySize.set(retryBatch.size());
             throw failure;
         }
+    }
+
+    private boolean hasPendingWrites() {
+        return !directQueue.isEmpty() || !worldEditQueue.isEmpty() || !retryBatch.isEmpty();
     }
 
     private <T> CompletableFuture<T> onDatabaseThread(DatabaseOperation<T> operation) {

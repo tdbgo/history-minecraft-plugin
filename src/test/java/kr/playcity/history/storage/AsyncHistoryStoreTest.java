@@ -150,4 +150,46 @@ class AsyncHistoryStoreTest {
             store.closeAsync().get(5, TimeUnit.SECONDS);
         }
     }
+
+    @Test
+    void backpressuresWorldEditBurstsWithoutRejectingRecords() throws Exception {
+        UUID worldId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        UUID batchId = UUID.randomUUID();
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("worldedit-backpressure.db"),
+            8,
+            4,
+            20,
+            1_000
+        );
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger());
+        try {
+            for (int index = 0; index < 2_048; index++) {
+                assertTrue(store.appendWorldEdit(new ChangeRecord(
+                    0L,
+                    100L + index,
+                    new BlockPosition(worldId, index, 64, 2),
+                    ActorRef.player(actorId, "Builder"),
+                    ChangeCause.WORLD_EDIT,
+                    BlockSnapshot.air(),
+                    BlockSnapshot.block("minecraft:stone"),
+                    null,
+                    batchId,
+                    ""
+                )));
+            }
+
+            store.query(HistoryQuery.at(worldId, 0, 64, 2, 0L, 10))
+                .get(10, TimeUnit.SECONDS);
+
+            assertEquals(2_048L, store.status().accepted());
+            assertEquals(2_048L, store.status().persisted());
+            assertEquals(0L, store.status().rejected());
+            assertTrue(store.status().accepting());
+            assertTrue(store.status().healthy());
+        } finally {
+            store.closeAsync().get(Duration.ofSeconds(10).toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
 }

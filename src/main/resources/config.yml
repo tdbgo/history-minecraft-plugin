@@ -3,8 +3,8 @@ config-version: 1
 storage:
   # sqlite or postgresql. Existing installations remain on SQLite.
   backend: sqlite
-  # Writes are owned by one DB thread. Larger batches reduce PostgreSQL round trips
-  # but keep more records in memory until a flush/query/shutdown boundary.
+  # Direct and FAWE capture have separate queues of this size. FAWE workers slow
+  # down when their lane is full instead of dropping rollback history.
   queue-capacity: 50000
   batch-size: 512
   flush-interval-ms: 50

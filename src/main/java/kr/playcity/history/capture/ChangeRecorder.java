@@ -102,6 +102,33 @@ public final class ChangeRecorder {
         }
     }
 
+    public boolean recordFaweBatchChange(
+        BlockPosition position,
+        ActorRef actor,
+        BlockSnapshot before,
+        BlockSnapshot after,
+        UUID batchId
+    ) {
+        if (before.sameState(after, true)) {
+            return true;
+        }
+        boolean accepted = positionGuard.recordMutation(position, () -> store.appendWorldEdit(
+            ChangeRecord.capturedInBatch(
+                position,
+                actor,
+                ChangeCause.WORLD_EDIT,
+                before,
+                after,
+                batchId,
+                ""
+            )
+        ));
+        if (!accepted) {
+            warnRejectedWrite();
+        }
+        return accepted;
+    }
+
     public void recordAudit(Location location, ActorRef actor, ChangeCause cause, String metadata) {
         recordAudit(location, actor, cause, null, metadata);
     }

@@ -15,6 +15,14 @@ import java.util.concurrent.CompletableFuture;
 public interface HistoryStore {
     boolean append(ChangeRecord change);
 
+    /**
+     * Appends a FAWE change with storage backpressure. Implementations may wait
+     * on a non-server worker instead of rejecting a recoverable burst.
+     */
+    default boolean appendWorldEdit(ChangeRecord change) {
+        return append(change);
+    }
+
     CompletableFuture<List<ChangeRecord>> query(HistoryQuery query);
 
     default CompletableFuture<java.util.Map<BlockPosition, ChangeRecord>> latestChanges(

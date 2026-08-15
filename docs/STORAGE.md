@@ -17,9 +17,9 @@ History reduces repeated data before it is stored:
 
 ## Backpressure
 
-Capture uses a bounded queue and never waits for a database round trip on the server thread. `storage.queue-capacity` is temporary burst and outage headroom.
+Direct changes and FAWE changes use separate bounded queues, so a large edit cannot consume the headroom reserved for players and server events. `storage.queue-capacity` applies to each lane.
 
-If the queue fills or storage fails, History rejects new records and reports an unhealthy state through `/history status`. It does not report rejected data as persisted.
+FAWE workers apply backpressure when their queue reaches its bound. They resume as the database writer drains records instead of dropping history. Direct server-thread capture never waits for a database round trip; a direct-queue overflow or storage failure remains visible through `/history status` rather than being reported as persisted.
 
 Place PostgreSQL on a reliable, low-latency network. Do not use a distant public-network database only to save local disk.
 

@@ -14,7 +14,7 @@ This alpha supports SQLite and PostgreSQL. It can capture compatible WorldEdit a
 
 ## Installation
 
-1. Build or download `History-0.4.0-alpha.2.jar`.
+1. Build or download `History-0.4.0-alpha.3.jar`.
 2. Copy it into the server's `plugins` directory.
 3. Restart Paper normally. Do not hot-reload the plugin.
 4. Run `/history status` and confirm that storage is ready.
