@@ -11,6 +11,7 @@ import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class HistoryConfigTest {
     @TempDir
@@ -18,8 +19,11 @@ class HistoryConfigTest {
 
     @Test
     void loadsBoundedDistantChunkDefaults() {
-        HistoryConfig.Rollback rollback = HistoryConfig.load(loadDefaultConfiguration(), dataDirectory).rollback();
+        HistoryConfig config = HistoryConfig.load(loadDefaultConfiguration(), dataDirectory);
+        HistoryConfig.Rollback rollback = config.rollback();
 
+        assertEquals(131_072, config.storage().worldEditQueueCapacity());
+        assertEquals(30_000, config.storage().worldEditAdmissionTimeoutMillis());
         assertEquals(10_000, rollback.maxRadius());
         assertEquals(256, rollback.maxChunksPerOperation());
         assertEquals(4, rollback.maxConcurrentChunkLeases());
@@ -30,15 +34,33 @@ class HistoryConfigTest {
     @Test
     void oldConfigurationReceivesBackwardCompatibleChunkLoadingDefaults() {
         YamlConfiguration source = loadDefaultConfiguration();
+        source.set("storage.worldedit-queue-capacity", null);
+        source.set("storage.worldedit-admission-timeout-ms", null);
         source.set("rollback.max-concurrent-chunk-leases", null);
         source.set("rollback.chunk-load-timeout-seconds", null);
         source.set("rollback.generate-missing-chunks", null);
 
-        HistoryConfig.Rollback rollback = HistoryConfig.load(source, dataDirectory).rollback();
+        HistoryConfig config = HistoryConfig.load(source, dataDirectory);
+        HistoryConfig.Rollback rollback = config.rollback();
 
+        assertEquals(131_072, config.storage().worldEditQueueCapacity());
+        assertEquals(30_000, config.storage().worldEditAdmissionTimeoutMillis());
         assertEquals(4, rollback.maxConcurrentChunkLeases());
         assertEquals(30, rollback.chunkLoadTimeoutSeconds());
         assertTrue(rollback.generateMissingChunks());
+    }
+
+    @Test
+    void rejectsUnsafeBlockEntityRestoration() {
+        YamlConfiguration source = loadDefaultConfiguration();
+        source.set("rollback.restore-block-entity-data", true);
+
+        ConfigException failure = assertThrows(
+            ConfigException.class,
+            () -> HistoryConfig.load(source, dataDirectory)
+        );
+
+        assertTrue(failure.getMessage().contains("safe atomic block-entity restoration"));
     }
 
     private static YamlConfiguration loadDefaultConfiguration() {

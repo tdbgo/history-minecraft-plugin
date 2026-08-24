@@ -8,15 +8,15 @@ import kr.playcity.history.model.BlockPosition;
 import kr.playcity.history.model.BlockSnapshot;
 import kr.playcity.history.model.ChangeRecord;
 import kr.playcity.history.model.HistoryQuery;
-import kr.playcity.history.model.OperationCompletion;
-import kr.playcity.history.model.OperationDraft;
+import kr.playcity.history.model.OperationCheckpoint;
+import kr.playcity.history.model.OperationFinalization;
+import kr.playcity.history.model.OperationHeader;
 import kr.playcity.history.model.OperationItem;
 import kr.playcity.history.model.OperationKind;
 import kr.playcity.history.model.OperationStatus;
-import kr.playcity.history.model.PlannedBlockChange;
-import kr.playcity.history.model.RollbackPlan;
-import kr.playcity.history.model.StoredOperation;
+import kr.playcity.history.model.OperationSummary;
 import kr.playcity.history.storage.HistoryStore;
+import kr.playcity.history.storage.StoreStatus;
 import kr.playcity.history.util.DurationParser;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
@@ -27,28 +27,35 @@ import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Supplier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
+/** Streaming, exact-chunk rollback engine. */
 public final class RollbackService {
+    private static final int WORLDWIDE_RADIUS = 42_500_000;
+
     private final JavaPlugin plugin;
     private final HistoryConfig.Rollback config;
     private final HistoryStore store;
     private final SnapshotCodec snapshots;
-    private final RollbackPlanner planner;
-    private final RollbackCandidateEvaluator candidateEvaluator = new RollbackCandidateEvaluator();
     private final LatestHistoryValidator latestHistoryValidator = new LatestHistoryValidator();
+    private final RecoveryReconciler recoveryReconciler = new RecoveryReconciler();
     private final PreviewRegistry previews;
     private final ActivePositionGuard positionGuard;
     private final ScopedChunkLeaseManager chunkLeases;
+    private final ExecutorService planExecutor;
+    private final Path planDirectory;
     private final Set<Execution> activeExecutions = ConcurrentHashMap.newKeySet();
 
     public RollbackService(
@@ -60,19 +67,23 @@ public final class RollbackService {
         PreviewRegistry previews,
         ActivePositionGuard positionGuard
     ) {
-        this.plugin = plugin;
-        this.config = config;
-        this.store = store;
-        this.snapshots = snapshots;
-        this.planner = planner;
-        this.previews = previews;
-        this.positionGuard = positionGuard;
+        this.plugin = Objects.requireNonNull(plugin, "plugin");
+        this.config = Objects.requireNonNull(config, "config");
+        this.store = Objects.requireNonNull(store, "store");
+        this.snapshots = Objects.requireNonNull(snapshots, "snapshots");
+        Objects.requireNonNull(planner, "planner");
+        this.previews = Objects.requireNonNull(previews, "previews");
+        this.positionGuard = Objects.requireNonNull(positionGuard, "positionGuard");
         this.chunkLeases = new ScopedChunkLeaseManager(
             plugin,
             config.maxConcurrentChunkLeases(),
             config.chunkLoadTimeoutSeconds(),
             config.generateMissingChunks()
         );
+        this.planExecutor = Executors.newSingleThreadExecutor(
+            Thread.ofPlatform().name("History-RollbackPlan").factory()
+        );
+        this.planDirectory = OperationPlanSpool.prepareDirectory(plugin.getDataFolder().toPath());
     }
 
     public CompletableFuture<RollbackPreview> createRollbackPreview(
@@ -82,230 +93,127 @@ public final class RollbackService {
         int radius
     ) {
         Location center = player.getLocation();
-        long since = Instant.now().minus(duration).toEpochMilli();
-        HistoryQuery query = HistoryQuery.nearby(
-            center.getWorld().getUID(),
+        return createRollbackPreview(
+            player,
+            actor,
+            duration,
+            center.getWorld(),
             center.getBlockX(),
             center.getBlockZ(),
             radius,
-            since,
+            "반경 " + radius
+        );
+    }
+
+    public CompletableFuture<RollbackPreview> createGlobalRollbackPreview(
+        Player player,
+        String actor,
+        Duration duration
+    ) {
+        return createRollbackPreview(
+            player,
             actor,
-            config.maxSourceChanges() + 1
-        ).forRollback();
-        UUID worldId = center.getWorld().getUID();
-        int centerX = center.getBlockX();
-        int centerZ = center.getBlockZ();
-        RequestedRollbackBoundary boundary = new RequestedRollbackBoundary(
-            worldId,
+            duration,
+            player.getWorld(),
+            0,
+            0,
+            WORLDWIDE_RADIUS,
+            "현재 월드 전체"
+        );
+    }
+
+    private CompletableFuture<RollbackPreview> createRollbackPreview(
+        Player player,
+        String actor,
+        Duration duration,
+        World world,
+        int centerX,
+        int centerZ,
+        int radius,
+        String scopeLabel
+    ) {
+        requireServerThread();
+        requireRollbackAvailable();
+        long since = Instant.now().minus(duration).toEpochMilli();
+        HistoryQuery query = HistoryQuery.nearby(
+            world.getUID(),
             centerX,
             centerZ,
-            radius
+            radius,
+            since,
+            actor,
+            config.planningFetchSize()
+        ).forRollback();
+        RequestedRollbackBoundary boundary = new RequestedRollbackBoundary(
+            world.getUID(), centerX, centerZ, radius
         );
         String actorLabel = actor == null || actor.equals("*") ? "모든 원인" : actor;
-        String summary = actorLabel + " · 최근 " + DurationParser.compact(duration) + " · 반경 " + radius;
-        return store.query(query).thenCompose(changes -> onServerThread(() -> {
-            boolean sourceLimitReached = changes.size() > config.maxSourceChanges();
-            List<ChangeRecord> boundedChanges = sourceLimitReached
-                ? changes.subList(0, config.maxSourceChanges())
-                : changes;
-            boundary.requireContainsAll(boundedChanges);
-            // Keep payloads in the plan even when restoration is disabled so block entities
-            // can be rejected safely instead of being silently emptied or duplicated.
-            RollbackPlan plan = planner.consolidate(boundedChanges, true);
-            List<PlannedBlockChange> executable = sourceLimitReached ? List.of() : plan.changes();
-            return evaluate(
-                player.getUniqueId(),
-                OperationKind.ROLLBACK,
-                summary,
-                null,
-                executable,
-                plan.sourceChangeCount(),
-                plan.unsafePositionCount() + (sourceLimitReached ? plan.changes().size() : 0),
-                sourceLimitReached
-            );
-        }));
+        String summary = actorLabel + " · 최근 " + DurationParser.compact(duration) + " · " + scopeLabel;
+        OperationPlanSpool.Writer writer = OperationPlanSpool.create(planDirectory);
+        StreamingRollbackPlanner planner = new StreamingRollbackPlanner(
+            boundary,
+            world.getMinHeight(),
+            world.getMaxHeight(),
+            config.restoreBlockEntityData(),
+            writer
+        );
+        return store.scanRollbackChanges(query, planner)
+            .thenApply(unused -> planner.finish())
+            .thenApply(result -> registerPreview(
+                player.getUniqueId(), OperationKind.ROLLBACK, summary, null, result
+            ))
+            .whenComplete((preview, failure) -> {
+                if (failure != null) {
+                    closeWriterAfterFailure(writer, failure);
+                    deletePlanAfterFailure(writer.path(), failure);
+                }
+            });
     }
 
     public CompletableFuture<RollbackPreview> createUndoPreview(Player player, UUID operationId) {
-        CompletableFuture<Optional<StoredOperation>> operationFuture = operationId == null
-            ? store.findLastOperation(player.getUniqueId())
-            : store.loadOperation(operationId);
+        requireRollbackAvailable();
+        CompletableFuture<Optional<OperationSummary>> operationFuture = operationId == null
+            ? store.findLastOperationSummary(player.getUniqueId())
+            : store.loadOperationSummary(operationId);
         return operationFuture.thenCompose(optional -> {
-            StoredOperation stored = optional.orElseThrow(
+            OperationSummary stored = optional.orElseThrow(
                 () -> new IllegalArgumentException("되돌릴 History 작업을 찾지 못했습니다.")
             );
             if (stored.status() != OperationStatus.APPLIED && stored.status() != OperationStatus.PARTIAL) {
                 throw new IllegalArgumentException("완료된 작업만 취소할 수 있습니다.");
             }
-            List<PlannedBlockChange> reversed = new ArrayList<>();
-            for (OperationItem item : stored.draft().items()) {
-                reversed.add(new PlannedBlockChange(
-                    item.position(),
-                    item.after(),
-                    item.before(),
-                    item.sourceIds().isEmpty() ? List.of((long) item.sequence()) : item.sourceIds()
-                ));
-            }
-            return onServerThread(() -> evaluate(
-                player.getUniqueId(),
-                OperationKind.UNDO,
-                "작업 " + shortId(stored.draft().id()) + " 취소",
-                stored.draft().id(),
-                reversed,
-                reversed.size(),
-                0,
-                false
-            ));
+            OperationPlanSpool.Writer writer = OperationPlanSpool.create(planDirectory);
+            UndoSpoolBuilder builder = new UndoSpoolBuilder(writer);
+            return store.scanAppliedOperationItems(stored.header().id(), builder::accept)
+                .thenApply(unused -> builder.finish())
+                .thenApply(result -> {
+                    if (result.candidateCount() != stored.appliedCount()) {
+                        throw new IllegalStateException("Undo plan did not contain every applied operation item");
+                    }
+                    return registerPreview(
+                        player.getUniqueId(),
+                        OperationKind.UNDO,
+                        "작업 " + shortId(stored.header().id()) + " 취소",
+                        stored.header().id(),
+                        result
+                    );
+                })
+                .whenComplete((preview, failure) -> {
+                    if (failure != null) {
+                        closeWriterAfterFailure(writer, failure);
+                        deletePlanAfterFailure(writer.path(), failure);
+                    }
+                });
         });
     }
 
-    public CompletableFuture<OperationRunResult> apply(Player player, String token) {
-        RollbackPreview preview = previews.consume(token, player.getUniqueId())
-            .orElseThrow(() -> new IllegalArgumentException("미리보기가 없거나 만료되었습니다."));
-        String requiredPermission = preview.kind() == OperationKind.ROLLBACK
-            ? "history.rollback"
-            : "history.undo";
-        if (!player.hasPermission(requiredPermission)) {
-            throw new IllegalArgumentException("이 작업을 적용할 권한이 없습니다.");
-        }
-        if (preview.items().isEmpty()) {
-            throw new IllegalArgumentException("적용할 안전한 변경이 없습니다.");
-        }
-
-        ExactMutationScope scope = ExactMutationScope.create(
-            preview.items(),
-            config.maxSourceChanges(),
-            config.maxChunksPerOperation()
-        );
-        ActivePositionGuard.Watch positionWatch = positionGuard.watch(
-            preview.items().stream().map(OperationItem::position).toList()
-        );
-        CompletableFuture<OperationRunResult> operation = validateLatestHistory(preview.items()).thenCompose(latestByPosition ->
-            onServerThread(() -> {
-                latestHistoryValidator.requireCurrent(
-                    preview.items(),
-                    latestByPosition,
-                    preview.kind(),
-                    preview.inverseOf(),
-                    config.restoreBlockEntityData()
-                );
-                return startPreparedOperation(player, preview, scope, positionWatch);
-            })
-        ).thenCompose(future -> future);
-        return operation.whenComplete((unused, failure) -> positionWatch.close());
-    }
-
-    private CompletableFuture<java.util.Map<BlockPosition, LatestHistoryValidator.LatestState>> validateLatestHistory(
-        List<OperationItem> items
-    ) {
-        List<BlockPosition> positions = items.stream().map(OperationItem::position).toList();
-        return store.latestChanges(positions).thenApply(changes -> {
-            java.util.Map<BlockPosition, LatestHistoryValidator.LatestState> latest = new java.util.HashMap<>();
-            for (ChangeRecord change : changes.values()) {
-                latest.put(
-                    change.position(),
-                    new LatestHistoryValidator.LatestState(
-                        change.id(),
-                        change.after(),
-                        change.operationId()
-                    )
-                );
-            }
-            return java.util.Map.copyOf(latest);
-        });
-    }
-
-    private CompletableFuture<OperationRunResult> startPreparedOperation(
-        Player player,
-        RollbackPreview preview,
-        ExactMutationScope scope,
-        ActivePositionGuard.Watch positionWatch
-    ) {
-
-        UUID operationId = UUID.randomUUID();
-        OperationDraft draft = new OperationDraft(
-            operationId,
-            System.currentTimeMillis(),
-            ActorRef.player(player.getUniqueId(), player.getName()),
-            preview.kind(),
-            preview.summary(),
-            preview.inverseOf(),
-            preview.items()
-        );
-        CompletableFuture<OperationRunResult> result = new CompletableFuture<>();
-        store.prepareOperation(draft).whenComplete((unused, failure) -> {
-            if (failure != null) {
-                result.completeExceptionally(failure);
-                return;
-            }
-            if (!plugin.isEnabled()) {
-                completeWithoutExecution(draft, "plugin-disabled-before-execution", result);
-                return;
-            }
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                Execution execution = new Execution(draft, scope, positionWatch, result);
-                activeExecutions.add(execution);
-                execution.start();
-            });
-        });
-        return result;
-    }
-
-    public boolean cancelPreview(Player player, String token) {
-        return previews.cancel(token, player.getUniqueId());
-    }
-
-    public CompletableFuture<Void> shutdown() {
-        List<CompletableFuture<OperationRunResult>> results = new ArrayList<>();
-        for (Execution execution : List.copyOf(activeExecutions)) {
-            execution.abort("plugin-disabled");
-            results.add(execution.result);
-        }
-        chunkLeases.close();
-        return CompletableFuture.allOf(results.toArray(CompletableFuture[]::new));
-    }
-
-    private RollbackPreview evaluate(
+    private RollbackPreview registerPreview(
         UUID ownerId,
         OperationKind kind,
         String summary,
         UUID inverseOf,
-        List<PlannedBlockChange> planned,
-        int sourceChanges,
-        int planningConflicts,
-        boolean sourceLimitReached
+        StreamingRollbackPlanner.Result result
     ) {
-        World world = null;
-        if (!planned.isEmpty()) {
-            UUID worldId = planned.getFirst().position().worldId();
-            boolean crossWorld = planned.stream().anyMatch(change -> !change.position().worldId().equals(worldId));
-            if (crossWorld) {
-                throw new IllegalArgumentException("한 번의 복구는 하나의 월드 안에서만 실행할 수 있습니다.");
-            }
-            world = Bukkit.getWorld(worldId);
-            if (world == null) {
-                throw new IllegalArgumentException("복구 대상 월드가 현재 로드되어 있지 않습니다: " + worldId);
-            }
-        }
-        RollbackCandidateEvaluator.Result evaluation = candidateEvaluator.evaluate(
-            planned,
-            world == null ? Integer.MIN_VALUE : world.getMinHeight(),
-            world == null ? Integer.MAX_VALUE : world.getMaxHeight(),
-            config.restoreBlockEntityData()
-        );
-        List<OperationItem> candidates = evaluation.candidates();
-        int conflicts = planningConflicts + evaluation.conflicts();
-        int alreadyTarget = evaluation.alreadyTarget();
-        if (!candidates.isEmpty()) {
-            // Validate both exact block and exact chunk limits before exposing a
-            // confirmation button. The same immutable scope is rebuilt after
-            // the single-use preview is consumed.
-            ExactMutationScope.create(
-                candidates,
-                config.maxSourceChanges(),
-                config.maxChunksPerOperation()
-            );
-        }
         RollbackPreview preview = new RollbackPreview(
             "",
             ownerId,
@@ -313,122 +221,276 @@ public final class RollbackService {
             kind,
             summary,
             inverseOf,
-            candidates,
-            sourceChanges,
-            conflicts,
-            alreadyTarget,
-            sourceLimitReached
+            result.candidateCount(),
+            result.chunkCount(),
+            result.sourceChanges(),
+            result.conflicts(),
+            result.alreadyTarget()
         );
-        return candidates.isEmpty() ? preview : previews.register(preview);
+        if (preview.itemCount() == 0) {
+            OperationPlanSpool.delete(result.planFile());
+            return preview;
+        }
+        return previews.register(preview, result.planFile());
+    }
+
+    public CompletableFuture<OperationRunResult> apply(Player player, String token) {
+        requireRollbackAvailable();
+        PreparedRollbackPreview prepared = previews.consume(token, player.getUniqueId())
+            .orElseThrow(() -> new IllegalArgumentException("미리보기가 없거나 만료되었습니다."));
+        RollbackPreview preview = prepared.preview();
+        String requiredPermission = preview.kind() == OperationKind.ROLLBACK
+            ? "history.rollback"
+            : "history.undo";
+        if (!player.hasPermission(requiredPermission)) {
+            OperationPlanSpool.delete(prepared.planFile());
+            throw new IllegalArgumentException("이 작업을 적용할 권한이 없습니다.");
+        }
+        if (preview.itemCount() == 0) {
+            OperationPlanSpool.delete(prepared.planFile());
+            throw new IllegalArgumentException("적용할 안전한 변경이 없습니다.");
+        }
+
+        OperationHeader header = new OperationHeader(
+            UUID.randomUUID(),
+            System.currentTimeMillis(),
+            ActorRef.player(player.getUniqueId(), player.getName()),
+            preview.kind(),
+            preview.summary(),
+            preview.inverseOf(),
+            preview.itemCount()
+        );
+        OperationPlanSpool.Reader preparationSource = OperationPlanSpool.open(prepared.planFile());
+        CompletableFuture<OperationRunResult> result = new CompletableFuture<>();
+        store.prepareOperation(header, preparationSource, config.operationWriteBatchSize())
+            .whenComplete((unused, failure) -> {
+                if (failure != null) {
+                    OperationPlanSpool.delete(prepared.planFile());
+                    result.completeExceptionally(failure);
+                    return;
+                }
+                if (!plugin.isEnabled()) {
+                    finalizeWithoutExecution(header, prepared.planFile(), result);
+                    return;
+                }
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    Execution execution = new Execution(header, prepared.planFile(), result, false, 0);
+                    activeExecutions.add(execution);
+                    execution.start();
+                });
+            });
+        return result;
+    }
+
+    /** Resumes a durable PREPARED operation from its database item stream. */
+    public CompletableFuture<OperationRunResult> recover(Player player, UUID operationId) {
+        requireServerThread();
+        Objects.requireNonNull(player, "player");
+        Objects.requireNonNull(operationId, "operationId");
+        return store.loadOperationSummary(operationId).thenCompose(optional -> {
+            OperationSummary summary = optional.orElseThrow(
+                () -> new IllegalArgumentException("복구할 History 작업을 찾지 못했습니다.")
+            );
+            if (summary.status() != OperationStatus.PREPARED) {
+                throw new IllegalArgumentException("PREPARED 상태의 중단 작업만 복구할 수 있습니다.");
+            }
+            OperationPlanSpool.Writer writer = OperationPlanSpool.create(planDirectory);
+            RecoverySpoolBuilder builder = new RecoverySpoolBuilder(writer);
+            return store.scanPendingOperationItems(operationId, builder::accept)
+                .thenCompose(unused -> {
+                    StreamingRollbackPlanner.Result pending = builder.finish();
+                    if (pending.candidateCount() == 0) {
+                        OperationStatus completed = summary.appliedCount() == summary.header().itemCount()
+                            ? OperationStatus.APPLIED
+                            : OperationStatus.PARTIAL;
+                        int skipped = summary.header().itemCount() - summary.appliedCount();
+                        return store.finalizeOperation(new OperationFinalization(
+                            operationId,
+                            System.currentTimeMillis(),
+                            completed,
+                            skipped,
+                            summary.failure()
+                        )).thenApply(ignored -> new OperationRunResult(
+                            operationId, completed, summary.appliedCount(), skipped, summary.failure()
+                        )).whenComplete((result, failure) -> OperationPlanSpool.delete(pending.planFile()));
+                    }
+                    CompletableFuture<OperationRunResult> result = new CompletableFuture<>();
+                    Runnable start = () -> {
+                        if (!plugin.isEnabled()) {
+                            OperationPlanSpool.delete(pending.planFile());
+                            result.completeExceptionally(recoveryFailure(
+                                operationId, "플러그인이 비활성화되어 복구를 시작하지 못했습니다.", null
+                            ));
+                            return;
+                        }
+                        Execution execution = new Execution(
+                            summary.header(), pending.planFile(), result, true, summary.appliedCount()
+                        );
+                        activeExecutions.add(execution);
+                        execution.start();
+                    };
+                    if (Bukkit.isPrimaryThread()) {
+                        start.run();
+                    } else {
+                        Bukkit.getScheduler().runTask(plugin, start);
+                    }
+                    return result;
+                }).whenComplete((result, failure) -> {
+                    if (failure != null) {
+                        closeWriterAfterFailure(writer, failure);
+                        deletePlanAfterFailure(writer.path(), failure);
+                    }
+                });
+        });
+    }
+
+    public boolean cancelPreview(Player player, String token) {
+        return previews.cancel(token, player.getUniqueId());
+    }
+
+    public CompletableFuture<Void> shutdown() {
+        requireServerThread();
+        previews.close();
+        List<CompletableFuture<OperationRunResult>> results = new ArrayList<>();
+        for (Execution execution : List.copyOf(activeExecutions)) {
+            execution.abort("plugin-disabled");
+            results.add(execution.result);
+        }
+        chunkLeases.close();
+        CompletableFuture<Void> completion = CompletableFuture.allOf(
+            results.toArray(CompletableFuture[]::new)
+        );
+        return completion.whenComplete((unused, failure) -> planExecutor.shutdown());
+    }
+
+    private void finalizeWithoutExecution(
+        OperationHeader header,
+        Path planFile,
+        CompletableFuture<OperationRunResult> result
+    ) {
+        OperationFinalization finalization = new OperationFinalization(
+            header.id(),
+            System.currentTimeMillis(),
+            OperationStatus.FAILED,
+            header.itemCount(),
+            "plugin-disabled-before-execution"
+        );
+        store.finalizeOperation(finalization).whenComplete((unused, failure) -> {
+            OperationPlanSpool.delete(planFile);
+            if (failure != null) {
+                result.completeExceptionally(failure);
+            } else {
+                result.complete(new OperationRunResult(
+                    header.id(), OperationStatus.FAILED, 0, header.itemCount(), finalization.failure()
+                ));
+            }
+        });
+    }
+
+    private CompletableFuture<java.util.Map<BlockPosition, LatestHistoryValidator.LatestState>>
+        validateLatestHistory(List<OperationItem> items) {
+        List<BlockPosition> positions = items.stream().map(OperationItem::position).toList();
+        return store.latestChanges(positions).thenApply(changes -> {
+            java.util.Map<BlockPosition, LatestHistoryValidator.LatestState> latest = new java.util.HashMap<>();
+            for (ChangeRecord change : changes.values()) {
+                latest.put(
+                    change.position(),
+                    new LatestHistoryValidator.LatestState(
+                        change.id(), change.after(), change.operationId()
+                    )
+                );
+            }
+            return java.util.Map.copyOf(latest);
+        });
     }
 
     private BlockSnapshot payloadMode(BlockSnapshot snapshot) {
         return config.restoreBlockEntityData() ? snapshot : snapshot.withoutPayload();
     }
 
-    private <T> CompletableFuture<T> onServerThread(Supplier<T> action) {
-        CompletableFuture<T> result = new CompletableFuture<>();
-        if (!plugin.isEnabled()) {
-            result.completeExceptionally(new IllegalStateException("History is disabled"));
-            return result;
-        }
-        Bukkit.getScheduler().runTask(plugin, () -> {
-            try {
-                result.complete(action.get());
-            } catch (RuntimeException exception) {
-                result.completeExceptionally(exception);
-            }
-        });
-        return result;
-    }
-
-    private void completeWithoutExecution(
-        OperationDraft draft,
-        String reason,
-        CompletableFuture<OperationRunResult> result
-    ) {
-        OperationCompletion completion = new OperationCompletion(
-            draft.id(),
-            System.currentTimeMillis(),
-            OperationStatus.FAILED,
-            List.of(),
-            draft.items().size(),
-            reason
-        );
-        store.completeOperation(completion).whenComplete((unused, failure) -> {
-            if (failure != null) {
-                result.completeExceptionally(failure);
-            } else {
-                result.complete(new OperationRunResult(
-                    draft.id(),
-                    OperationStatus.FAILED,
-                    0,
-                    draft.items().size(),
-                    reason
-                ));
-            }
-        });
-    }
-
-    private static String shortId(UUID id) {
-        return id.toString().substring(0, 8);
-    }
-
     private final class Execution {
-        private final OperationDraft draft;
-        private final ExactMutationScope scope;
-        private final ActivePositionGuard.Watch positionWatch;
+        private final OperationHeader header;
+        private final Path planFile;
         private final CompletableFuture<OperationRunResult> result;
-        private final List<AppliedOperationItem> applied = new ArrayList<>();
-        private final List<ExactChunkCoordinate> chunks;
-        private int chunkCursor;
-        private List<OperationItem> currentItems = List.of();
-        private int currentItemCursor;
-        private int processedItems;
-        private int skipped;
-        private String firstFailure = "";
+        private final List<AppliedOperationItem> appliedInChunk = new ArrayList<>();
+        private OperationPlanSpool.Reader reader;
+        private CompletableFuture<OperationPlanSpool.PlanChunk> pendingPlanRead;
         private CompletableFuture<ScopedChunkLeaseManager.Lease> pendingLease;
+        private OperationPlanSpool.PlanChunk currentChunk;
+        private ExactMutationScope currentScope;
+        private ActivePositionGuard.Watch currentWatch;
         private ScopedChunkLeaseManager.Lease activeLease;
         private BukkitTask tickTask;
-        private boolean finished;
+        private int itemCursor;
+        private int appliedTotal;
+        private String firstFailure = "";
+        private boolean terminalRequested;
+        private boolean checkpointInFlight;
+        private boolean finalizationStarted;
+        private final boolean recovering;
 
         private Execution(
-            OperationDraft draft,
-            ExactMutationScope scope,
-            ActivePositionGuard.Watch positionWatch,
-            CompletableFuture<OperationRunResult> result
+            OperationHeader header,
+            Path planFile,
+            CompletableFuture<OperationRunResult> result,
+            boolean recovering,
+            int alreadyApplied
         ) {
-            this.draft = draft;
-            this.scope = scope;
-            this.positionWatch = positionWatch;
+            this.header = header;
+            this.planFile = planFile;
             this.result = result;
-            this.chunks = scope.chunks();
+            this.recovering = recovering;
+            this.appliedTotal = alreadyApplied;
         }
 
         private void start() {
             requireServerThread();
-            loadNextChunk();
+            readNextChunk();
         }
 
-        private void loadNextChunk() {
+        private void readNextChunk() {
+            if (terminalRequested || finalizationStarted) {
+                checkpointOrFinalize(false);
+                return;
+            }
+            pendingPlanRead = CompletableFuture.supplyAsync(() -> {
+                if (reader == null) {
+                    reader = OperationPlanSpool.open(planFile);
+                }
+                return reader.readChunk();
+            }, planExecutor);
+            pendingPlanRead.whenComplete((chunk, failure) -> runOnServerForExecution(() -> {
+                pendingPlanRead = null;
+                if (failure != null) {
+                    fail("rollback-plan-read-failed", failure);
+                } else if (terminalRequested) {
+                    checkpointOrFinalize(false);
+                } else if (chunk == null) {
+                    requestFinish("");
+                } else {
+                    beginChunk(chunk);
+                }
+            }));
+        }
+
+        private void beginChunk(OperationPlanSpool.PlanChunk chunk) {
             requireServerThread();
-            if (finished) {
-                return;
-            }
-            if (chunkCursor >= chunks.size()) {
-                finish("");
-                return;
-            }
-            ExactChunkCoordinate target = chunks.get(chunkCursor++);
             try {
-                scope.requireChunkAllowed(target);
-            } catch (RuntimeException violation) {
-                firstFailure = describeFailure(violation);
-                finish("chunk-scope-violation");
-                return;
+                currentChunk = chunk;
+                currentScope = ExactMutationScope.create(chunk.items());
+                currentScope.requireChunkAllowed(chunk.coordinate());
+                currentWatch = positionGuard.watch(
+                    chunk.items().stream().map(OperationItem::position).toList()
+                );
+                itemCursor = 0;
+                appliedInChunk.clear();
+                pendingLease = chunkLeases.acquire(currentScope, chunk.coordinate());
+                pendingLease.whenComplete((lease, failure) -> runOnServerForExecution(
+                    () -> handleLease(chunk.coordinate(), lease, failure)
+                ));
+            } catch (RuntimeException failure) {
+                fail("chunk-scope-violation", failure);
             }
-            pendingLease = chunkLeases.acquire(scope, target);
-            pendingLease.whenComplete((lease, failure) -> handleLease(target, lease, failure));
         }
 
         private void handleLease(
@@ -436,136 +498,139 @@ public final class RollbackService {
             ScopedChunkLeaseManager.Lease lease,
             Throwable failure
         ) {
-            requireServerThread();
             pendingLease = null;
-            if (finished) {
+            if (terminalRequested) {
                 if (lease != null) {
                     lease.close();
                 }
+                checkpointOrFinalize(false);
                 return;
             }
             if (failure != null) {
-                firstFailure = describeFailure(failure);
-                finish("chunk-load-failed");
+                fail("chunk-load-failed", failure);
                 return;
             }
             try {
-                if (!lease.coordinate().equals(target)) {
+                if (lease == null || !lease.coordinate().equals(target)) {
                     throw new IllegalStateException("Loaded chunk does not match its exact work group");
                 }
-                scope.requireChunkAllowed(lease.coordinate());
+                currentScope.requireChunkAllowed(lease.coordinate());
                 lease.chunk();
                 activeLease = lease;
-                currentItems = scope.itemsIn(lease.coordinate());
-                currentItemCursor = 0;
-                validateCurrentChunkHistory();
+                if (recovering) {
+                    startMutationTicks();
+                } else {
+                    validateCurrentChunkHistory();
+                }
             } catch (RuntimeException violation) {
-                lease.close();
-                firstFailure = describeFailure(violation);
-                finish("chunk-scope-violation");
+                if (lease != null) {
+                    lease.close();
+                }
+                fail("chunk-scope-violation", violation);
             }
         }
 
         private void validateCurrentChunkHistory() {
-            List<OperationItem> validatingItems = currentItems;
-            validateLatestHistory(validatingItems).whenComplete((latestByPosition, failure) -> {
-                if (!plugin.isEnabled()) {
-                    return;
-                }
-                try {
-                    Bukkit.getScheduler().runTask(plugin, () -> {
-                        if (finished || currentItems != validatingItems) {
-                            return;
-                        }
-                        if (failure != null) {
-                            firstFailure = describeFailure(failure);
-                            finish("chunk-history-validation-failed");
-                            return;
-                        }
+            List<OperationItem> validatingItems = currentChunk.items();
+            validateLatestHistory(validatingItems).whenComplete((latestByPosition, failure) ->
+                runOnServerForExecution(() -> {
+                    if (terminalRequested) {
+                        checkpointOrFinalize(false);
+                    } else if (failure != null) {
+                        fail("chunk-history-validation-failed", failure);
+                    } else {
                         try {
                             latestHistoryValidator.requireCurrent(
                                 validatingItems,
                                 latestByPosition,
-                                draft.kind(),
-                                draft.inverseOf(),
+                                header.kind(),
+                                header.inverseOf(),
                                 config.restoreBlockEntityData()
                             );
-                            validatingItems.forEach(item -> positionWatch.requireUnchanged(item.position()));
-                            tickTask = Bukkit.getScheduler().runTaskTimer(plugin, this::runTick, 0L, 1L);
+                            validatingItems.forEach(item -> currentWatch.requireUnchanged(item.position()));
+                            startMutationTicks();
                         } catch (RuntimeException stale) {
-                            firstFailure = describeFailure(stale);
-                            finish("chunk-history-became-stale");
+                            fail("chunk-history-became-stale", stale);
                         }
-                    });
-                } catch (RuntimeException ignored) {
-                    // Plugin shutdown owns execution finalization and ticket release.
-                }
-            });
+                    }
+                })
+            );
+        }
+
+        private void startMutationTicks() {
+            currentChunk.items().forEach(item -> currentWatch.requireUnchanged(item.position()));
+            tickTask = Bukkit.getScheduler().runTaskTimer(plugin, this::runTick, 0L, 1L);
         }
 
         private void runTick() {
             requireServerThread();
             int processed = 0;
-            while (currentItemCursor < currentItems.size() && processed < config.blocksPerTick()) {
-                OperationItem item = currentItems.get(currentItemCursor++);
-                processedItems++;
+            while (itemCursor < currentChunk.items().size() && processed < config.blocksPerTick()) {
+                OperationItem item = currentChunk.items().get(itemCursor++);
                 processed++;
                 try {
-                    scope.requireAllowed(item);
-                    positionWatch.requireUnchanged(item.position());
+                    currentScope.requireAllowed(item);
+                    currentWatch.requireUnchanged(item.position());
                     if (!ExactChunkCoordinate.from(item.position()).equals(activeLease.coordinate())) {
                         throw new IllegalStateException("Rollback item escaped its leased exact chunk");
                     }
                 } catch (RuntimeException violation) {
-                    skipped++;
-                    firstFailure = describeFailure(violation);
-                    finish("mutation-scope-violation");
+                    fail("mutation-scope-violation", violation);
                     return;
                 }
                 if (!applyOne(item)) {
-                    finish("block-application-failed");
+                    requestFinish("block-application-failed");
                     return;
                 }
             }
-            if (currentItemCursor >= currentItems.size()) {
-                finishCurrentChunk();
-                loadNextChunk();
+            if (itemCursor >= currentChunk.items().size()) {
+                stopTick();
+                checkpointOrFinalize(true);
             }
         }
 
         private boolean applyOne(OperationItem item) {
-            int appliedBefore = applied.size();
             try {
                 Chunk chunk = activeLease.chunk();
                 World world = chunk.getWorld();
                 if (item.position().y() < world.getMinHeight() || item.position().y() >= world.getMaxHeight()) {
-                    skipped++;
                     firstFailure = "World height changed after the rollback preview";
                     return false;
                 }
                 Block block = chunk.getBlock(
-                    item.position().x() & 15,
-                    item.position().y(),
-                    item.position().z() & 15
+                    item.position().x() & 15, item.position().y(), item.position().z() & 15
                 );
                 BlockSnapshot current = payloadMode(snapshots.capture(block));
+                if (recovering) {
+                    RecoveryReconciler.Decision decision = recoveryReconciler.decide(
+                        current, item.before(), item.after(), config.restoreBlockEntityData()
+                    );
+                    if (decision == RecoveryReconciler.Decision.ALREADY_APPLIED) {
+                        appliedInChunk.add(new AppliedOperationItem(item, item.before(), current));
+                        return true;
+                    }
+                    if (decision == RecoveryReconciler.Decision.CONFLICT) {
+                        firstFailure = "중단 작업 복구 중 현재 블록이 계획의 이전/목표 상태와 모두 다릅니다: "
+                            + item.position().x() + "," + item.position().y() + "," + item.position().z();
+                        return false;
+                    }
+                }
                 if (!current.sameState(item.before(), config.restoreBlockEntityData())) {
-                    skipped++;
                     firstFailure = "Live block state changed after chunk history validation at "
                         + item.position().x() + "," + item.position().y() + "," + item.position().z();
                     return false;
                 }
-                positionWatch.requireUnchanged(item.position());
+                currentWatch.requireUnchanged(item.position());
                 snapshots.apply(block, item.after(), config.restoreBlockEntityData());
                 BlockSnapshot actualAfter;
                 try {
                     actualAfter = payloadMode(snapshots.capture(block));
                 } catch (RuntimeException captureFailure) {
-                    applied.add(new AppliedOperationItem(item, current, item.after()));
+                    appliedInChunk.add(new AppliedOperationItem(item, current, item.after()));
                     throw captureFailure;
                 }
-                applied.add(new AppliedOperationItem(item, current, actualAfter));
-                positionWatch.requireUnchanged(item.position());
+                appliedInChunk.add(new AppliedOperationItem(item, current, actualAfter));
+                currentWatch.requireUnchanged(item.position());
                 if (!actualAfter.sameState(item.after(), config.restoreBlockEntityData())) {
                     firstFailure = "Applied block did not reach its planned target state at "
                         + item.position().x() + "," + item.position().y() + "," + item.position().z();
@@ -573,9 +638,6 @@ public final class RollbackService {
                 }
                 return true;
             } catch (RuntimeException exception) {
-                if (applied.size() == appliedBefore) {
-                    skipped++;
-                }
                 if (firstFailure.isEmpty()) {
                     firstFailure = describeFailure(exception);
                 }
@@ -583,67 +645,245 @@ public final class RollbackService {
             }
         }
 
-        private void abort(String reason) {
-            finish(reason);
-        }
-
-        private void finishCurrentChunk() {
-            requireServerThread();
-            if (tickTask != null) {
-                tickTask.cancel();
-                tickTask = null;
-            }
-            if (activeLease != null) {
-                activeLease.close();
-                activeLease = null;
-            }
-            currentItems = List.of();
-            currentItemCursor = 0;
-        }
-
-        private void finish(String reason) {
-            if (finished) {
+        private void checkpointOrFinalize(boolean continueAfter) {
+            if (checkpointInFlight || finalizationStarted) {
                 return;
             }
-            finished = true;
+            stopTick();
+            if (appliedInChunk.isEmpty()) {
+                closeCurrentChunk();
+                if (continueAfter && !terminalRequested) {
+                    readNextChunk();
+                } else {
+                    finalizeOperation();
+                }
+                return;
+            }
+            checkpointInFlight = true;
+            List<AppliedOperationItem> checkpointItems = List.copyOf(appliedInChunk);
+            store.checkpointOperation(new OperationCheckpoint(
+                header.id(), System.currentTimeMillis(), checkpointItems
+            )).whenComplete((unused, failure) -> runOnServerForExecution(() -> {
+                checkpointInFlight = false;
+                if (failure != null) {
+                    firstFailure = describeFailure(failure);
+                    abandonInterruptedOperation(failure);
+                    return;
+                }
+                appliedTotal = Math.addExact(appliedTotal, checkpointItems.size());
+                appliedInChunk.clear();
+                closeCurrentChunk();
+                if (continueAfter && !terminalRequested) {
+                    readNextChunk();
+                } else {
+                    finalizeOperation();
+                }
+            }));
+        }
+
+        private void requestFinish(String reason) {
+            if (!reason.isEmpty() && firstFailure.isEmpty()) {
+                firstFailure = reason;
+            }
+            terminalRequested = true;
+            stopTick();
+            if (pendingPlanRead != null) {
+                return;
+            }
             if (pendingLease != null) {
                 pendingLease.cancel(false);
                 pendingLease = null;
             }
-            finishCurrentChunk();
+            checkpointOrFinalize(false);
+        }
+
+        private void fail(String reason, Throwable failure) {
+            if (firstFailure.isEmpty()) {
+                firstFailure = describeFailure(failure);
+            }
+            requestFinish(reason);
+        }
+
+        private void abort(String reason) {
+            requestFinish(reason);
+        }
+
+        private void finalizeOperation() {
+            if (finalizationStarted) {
+                return;
+            }
+            finalizationStarted = true;
+            closeCurrentChunk();
+            closeReader();
             activeExecutions.remove(this);
-            int notVisited = draft.items().size() - processedItems;
-            skipped += notVisited;
-            String failure = firstFailure.isEmpty() ? reason : firstFailure;
+            int skipped = header.itemCount() - appliedTotal;
             OperationStatus status;
-            if (applied.isEmpty()) {
+            if (appliedTotal == 0) {
                 status = OperationStatus.FAILED;
-            } else if (skipped == 0 && failure.isEmpty()) {
+            } else if (skipped == 0 && firstFailure.isEmpty()) {
                 status = OperationStatus.APPLIED;
             } else {
                 status = OperationStatus.PARTIAL;
             }
-            OperationCompletion completion = new OperationCompletion(
-                draft.id(),
-                System.currentTimeMillis(),
-                status,
-                applied,
-                skipped,
-                failure
+            OperationFinalization finalization = new OperationFinalization(
+                header.id(), System.currentTimeMillis(), status, skipped, firstFailure
             );
-            store.completeOperation(completion).whenComplete((unused, storageFailure) -> {
-                if (storageFailure != null) {
-                    result.completeExceptionally(storageFailure);
+            store.finalizeOperation(finalization).whenComplete((unused, failure) -> {
+                OperationPlanSpool.delete(planFile);
+                if (failure != null) {
+                    result.completeExceptionally(recoveryFailure(
+                        header.id(), "작업 완료 상태를 저장하지 못했습니다.", failure
+                    ));
                 } else {
                     result.complete(new OperationRunResult(
-                        draft.id(),
-                        status,
-                        applied.size(),
-                        skipped,
-                        failure
+                        header.id(), status, appliedTotal, skipped, firstFailure
                     ));
                 }
             });
+        }
+
+        private void abandonInterruptedOperation(Throwable failure) {
+            finalizationStarted = true;
+            closeCurrentChunk();
+            closeReader();
+            activeExecutions.remove(this);
+            OperationPlanSpool.delete(planFile);
+            result.completeExceptionally(recoveryFailure(
+                header.id(),
+                "월드 변경 뒤 체크포인트를 확정하지 못했습니다.",
+                failure
+            ));
+        }
+
+        private void closeCurrentChunk() {
+            stopTick();
+            if (activeLease != null) {
+                activeLease.close();
+                activeLease = null;
+            }
+            if (currentWatch != null) {
+                currentWatch.close();
+                currentWatch = null;
+            }
+            currentChunk = null;
+            currentScope = null;
+            itemCursor = 0;
+        }
+
+        private void stopTick() {
+            if (tickTask != null) {
+                tickTask.cancel();
+                tickTask = null;
+            }
+        }
+
+        private void closeReader() {
+            if (reader != null) {
+                reader.close();
+                reader = null;
+            }
+        }
+
+        private void runOnServerForExecution(Runnable action) {
+            if (Bukkit.isPrimaryThread()) {
+                action.run();
+            } else if (plugin.isEnabled()) {
+                Bukkit.getScheduler().runTask(plugin, action);
+            } else {
+                action.run();
+            }
+        }
+    }
+
+    private static final class UndoSpoolBuilder {
+        private final OperationPlanSpool.Writer writer;
+        private ExactChunkCoordinate lastChunk;
+        private int candidates;
+        private int chunks;
+
+        private UndoSpoolBuilder(OperationPlanSpool.Writer writer) {
+            this.writer = writer;
+        }
+
+        private void accept(OperationItem item) {
+            writer.write(new OperationItem(
+                item.sequence(), item.position(), item.after(), item.before(), item.sourceIds()
+            ));
+            candidates = Math.incrementExact(candidates);
+            ExactChunkCoordinate chunk = ExactChunkCoordinate.from(item.position());
+            if (!chunk.equals(lastChunk)) {
+                chunks = Math.incrementExact(chunks);
+                lastChunk = chunk;
+            }
+        }
+
+        private StreamingRollbackPlanner.Result finish() {
+            writer.close();
+            return new StreamingRollbackPlanner.Result(
+                writer.path(), candidates, candidates, chunks, 0, 0
+            );
+        }
+    }
+
+    private static final class RecoverySpoolBuilder {
+        private final OperationPlanSpool.Writer writer;
+        private ExactChunkCoordinate lastChunk;
+        private int candidates;
+        private int chunks;
+
+        private RecoverySpoolBuilder(OperationPlanSpool.Writer writer) {
+            this.writer = writer;
+        }
+
+        private void accept(OperationItem item) {
+            writer.write(item);
+            candidates = Math.incrementExact(candidates);
+            ExactChunkCoordinate chunk = ExactChunkCoordinate.from(item.position());
+            if (!chunk.equals(lastChunk)) {
+                chunks = Math.incrementExact(chunks);
+                lastChunk = chunk;
+            }
+        }
+
+        private StreamingRollbackPlanner.Result finish() {
+            writer.close();
+            return new StreamingRollbackPlanner.Result(
+                writer.path(), candidates, candidates, chunks, 0, 0
+            );
+        }
+    }
+
+    private static void closeWriterAfterFailure(OperationPlanSpool.Writer writer, Throwable failure) {
+        try {
+            writer.close();
+        } catch (RuntimeException closeFailure) {
+            failure.addSuppressed(closeFailure);
+        }
+    }
+
+    private static void deletePlanAfterFailure(Path planFile, Throwable failure) {
+        try {
+            OperationPlanSpool.delete(planFile);
+        } catch (RuntimeException deleteFailure) {
+            failure.addSuppressed(deleteFailure);
+        }
+    }
+
+    private static String shortId(UUID id) {
+        return id.toString().substring(0, 8);
+    }
+
+    private void requireRollbackAvailable() {
+        StoreStatus status = store.status();
+        if (!status.ready() || !status.healthy() || !status.accepting() || status.degraded()) {
+            throw new IllegalArgumentException(
+                "기록 저장소가 정상 상태가 아니므로 복구 작업을 시작할 수 없습니다. /history status를 확인하십시오."
+            );
+        }
+        if (status.interruptedOperations() > 0) {
+            throw new IllegalArgumentException(
+                "미복구 중단 작업이 있습니다. 해당 작업 ID로 /history recover <operation-id>를 먼저 실행하십시오."
+            );
         }
     }
 
@@ -661,6 +901,15 @@ public final class RollbackService {
             current = current.getCause();
         }
         String message = current.getMessage();
-        return current.getClass().getSimpleName() + (message == null || message.isBlank() ? "" : ": " + message);
+        return current.getClass().getSimpleName()
+            + (message == null || message.isBlank() ? "" : ": " + message);
+    }
+
+    private static IllegalStateException recoveryFailure(UUID operationId, String message, Throwable cause) {
+        String instruction = message + " 작업 ID: " + operationId
+            + " · 저장소가 정상화된 뒤 /history recover " + operationId + " 를 실행하십시오.";
+        return cause == null
+            ? new IllegalStateException(instruction)
+            : new IllegalStateException(instruction, cause);
     }
 }

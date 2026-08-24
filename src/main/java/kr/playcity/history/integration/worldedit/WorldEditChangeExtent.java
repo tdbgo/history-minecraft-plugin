@@ -38,9 +38,10 @@ final class WorldEditChangeExtent extends AbstractDelegateExtent {
     public <T extends BlockStateHolder<T>> boolean setBlock(BlockVector3 position, T target)
         throws WorldEditException {
         String before = getExtent().getBlock(position).getAsString();
+        String after = target.getAsString();
         boolean changed = super.setBlock(position, target);
         if (changed) {
-            record(position.x(), position.y(), position.z(), before, target.getAsString());
+            recordApplied(position.x(), position.y(), position.z(), before, after);
         }
         return changed;
     }
@@ -55,15 +56,16 @@ final class WorldEditChangeExtent extends AbstractDelegateExtent {
         throws WorldEditException {
         BlockVector3 position = BlockVector3.at(x, y, z);
         String before = getExtent().getBlock(position).getAsString();
+        String after = target.getAsString();
         boolean changed = getExtent().setBlock(position, target);
         if (changed) {
-            record(x, y, z, before, target.getAsString());
+            recordApplied(x, y, z, before, after);
         }
         return changed;
     }
 
-    private void record(int x, int y, int z, String before, String after) {
-        recorder.recordBatchChange(
+    private void recordApplied(int x, int y, int z, String before, String after) {
+        recorder.recordAppliedBatchChange(
             new BlockPosition(worldId, x, y, z),
             actor,
             ChangeCause.WORLD_EDIT,

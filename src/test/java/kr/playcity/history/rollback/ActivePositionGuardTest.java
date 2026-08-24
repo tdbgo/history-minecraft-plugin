@@ -56,6 +56,18 @@ class ActivePositionGuardTest {
     }
 
     @Test
+    void lightweightBoundaryMarkInvalidatesOnlyAnActiveWatch() {
+        ActivePositionGuard guard = new ActivePositionGuard();
+        guard.markMutation(TARGET);
+        assertEquals(0, guard.watchedPositionCount());
+
+        try (ActivePositionGuard.Watch watch = guard.watch(List.of(TARGET))) {
+            guard.markMutation(TARGET);
+            assertThrows(IllegalStateException.class, () -> watch.requireUnchanged(TARGET));
+        }
+    }
+
+    @Test
     void rejectsDuplicateWatchCoordinates() {
         ActivePositionGuard guard = new ActivePositionGuard();
         assertThrows(IllegalArgumentException.class, () -> guard.watch(List.of(TARGET, TARGET)));

@@ -97,7 +97,7 @@ public final class WorldEditIntegration implements AutoCloseable {
                 if (faweBridgeFailureLogged.compareAndSet(false, true)) {
                     logger.log(
                         Level.SEVERE,
-                        "History could not attach its FAWE batch processor; using the WorldEdit extent fallback",
+                        "History FAWE 후처리 캡처를 연결하지 못해 WorldEdit extent 방식으로 기록합니다.",
                         failure
                     );
                 }

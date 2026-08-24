@@ -105,6 +105,12 @@ public final class ExactMutationScope {
         return new ExactMutationScope(allowed, itemsByChunk, stableChunks, fingerprint(stable));
     }
 
+    /** Creates one exact, already-bounded chunk scope without a user-visible size cap. */
+    public static ExactMutationScope create(List<OperationItem> items) {
+        Objects.requireNonNull(items, "items");
+        return create(items, Integer.MAX_VALUE, 1);
+    }
+
     public void requireAllowed(OperationItem item) {
         Objects.requireNonNull(item, "item");
         OperationItem expected = allowed.get(item.position());

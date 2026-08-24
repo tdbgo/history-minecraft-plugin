@@ -4,6 +4,7 @@ import com.fastasyncworldedit.core.queue.IBatchProcessor;
 import com.fastasyncworldedit.core.queue.IChunk;
 import com.fastasyncworldedit.core.queue.IChunkGet;
 import com.fastasyncworldedit.core.queue.IChunkSet;
+import com.fastasyncworldedit.core.extent.processor.ProcessorScope;
 import com.sk89q.worldedit.extent.Extent;
 import com.sk89q.worldedit.world.block.BlockState;
 import com.sk89q.worldedit.world.block.BlockTypesCache;
@@ -11,11 +12,17 @@ import kr.playcity.history.capture.ChangeRecorder;
 import kr.playcity.history.model.ActorRef;
 import kr.playcity.history.model.BlockPosition;
 import kr.playcity.history.model.BlockSnapshot;
+import kr.playcity.history.model.ChangeCause;
+import kr.playcity.history.model.ChangeRecord;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -31,6 +38,7 @@ final class FaweBatchProcessor implements IBatchProcessor {
     private final ChangeRecorder recorder;
     private final Logger logger;
     private final Map<BlockState, String> stateStrings = new ConcurrentHashMap<>();
+    private final FaweChunkAdmission admission = new FaweChunkAdmission();
     private final AtomicBoolean failureLogged = new AtomicBoolean();
 
     FaweBatchProcessor(
@@ -49,22 +57,39 @@ final class FaweBatchProcessor implements IBatchProcessor {
 
     @Override
     public IChunkSet processSet(IChunk chunk, IChunkGet get, IChunkSet set) {
-        try {
-            capture(chunk, get, set);
-        } catch (RuntimeException | LinkageError failure) {
-            if (failureLogged.compareAndSet(false, true)) {
-                logger.log(
-                    Level.SEVERE,
-                    "FAWE changed the world, but History could not capture an edit batch",
-                    failure
-                );
-            }
-            throw failure;
-        }
+        // This processor is installed only as a post-processor. Keep the
+        // method harmless if FAWE invokes it through an implementation detail.
         return set;
     }
 
-    private void capture(IChunk chunk, IChunkGet get, IChunkSet set) {
+    @Override
+    public Future<?> postProcessSet(IChunk chunk, IChunkGet get, IChunkSet set) {
+        long chunkKey = chunkKey(chunk);
+        if (!admission.beginPost(chunkKey)) {
+            return CompletableFuture.completedFuture(null);
+        }
+        try {
+            List<ChangeRecord> changes = capture(chunk, get, set);
+            recorder.recordAppliedFaweBatch(changes);
+        } catch (RuntimeException | LinkageError failure) {
+            recorder.reportFaweCaptureGap(
+                0L,
+                "FAWE가 적용한 청크의 변경 기록을 검사하지 못했습니다: " + chunk.getX() + "," + chunk.getZ()
+            );
+            if (failureLogged.compareAndSet(false, true)) {
+                logger.log(Level.WARNING, "History FAWE 후처리 캡처에 실패했지만 편집 결과는 유지됩니다.", failure);
+            }
+        }
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Override
+    public void flush() {
+        admission.releaseAll();
+    }
+
+    private List<ChangeRecord> capture(IChunk chunk, IChunkGet get, IChunkSet set) {
+        List<ChangeRecord> changes = new ArrayList<>();
         int baseX = chunk.getX() << 4;
         int baseZ = chunk.getZ() << 4;
         for (int section = get.getMinSectionPosition(); section <= get.getMaxSectionPosition(); section++) {
@@ -90,22 +115,20 @@ final class FaweBatchProcessor implements IBatchProcessor {
                         if (before == after || before.equals(after)) {
                             continue;
                         }
-                        boolean accepted = recorder.recordFaweBatchChange(
+                        changes.add(ChangeRecord.capturedInBatch(
                             new BlockPosition(worldId, baseX + localX, y, baseZ + localZ),
                             actor,
+                            ChangeCause.WORLD_EDIT,
                             BlockSnapshot.block(stateString(before)),
                             BlockSnapshot.block(stateString(after)),
-                            batchId
-                        );
-                        if (!accepted) {
-                            throw new IllegalStateException(
-                                "History storage could not admit a FAWE change before chunk application"
-                            );
-                        }
+                            batchId,
+                            ""
+                        ));
                     }
                 }
             }
         }
+        return changes;
     }
 
     @Override
@@ -115,7 +138,17 @@ final class FaweBatchProcessor implements IBatchProcessor {
         return child;
     }
 
+    @Override
+    public ProcessorScope getScope() {
+        // FAWE supplies the pre-change chunk copy to post processors at this scope.
+        return ProcessorScope.READING_BLOCKS;
+    }
+
     private String stateString(BlockState state) {
         return stateStrings.computeIfAbsent(state, BlockState::getAsString);
+    }
+
+    private static long chunkKey(IChunk chunk) {
+        return ((long) chunk.getX() << 32) ^ (chunk.getZ() & 0xffff_ffffL);
     }
 }

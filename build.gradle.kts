@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "kr.playcity"
-version = "0.4.0-alpha.3"
+version = "0.4.0-alpha.6"
 
 val paperApiVersion = providers.gradleProperty("paperApiVersion")
 val javaVersion = providers.gradleProperty("javaVersion").map(String::toInt)

@@ -32,7 +32,8 @@ import java.util.function.Consumer;
 
 public final class HistoryCommand implements CommandExecutor, TabCompleter {
     private static final List<String> SUBCOMMANDS = List.of(
-        "inspect", "lookup", "search", "near", "rollback", "confirm", "cancel", "undo", "status", "storage"
+        "inspect", "lookup", "search", "near", "rollback", "confirm", "cancel", "undo",
+        "status", "storage", "resume", "recover"
     );
     private final JavaPlugin plugin;
     private final HistoryConfig config;
@@ -62,7 +63,8 @@ public final class HistoryCommand implements CommandExecutor, TabCompleter {
                 player.sendMessage(HistoryUi.dashboard(inspection.isEnabled(player)));
             } else {
                 sender.sendMessage(
-                    "History: /history lookup t:1d r:10 w:world x:0 z:0 | /history status | /history storage"
+                    "History: /history lookup t:1d r:10 w:world x:0 z:0 | /history status "
+                        + "| /history storage | /history resume | /history recover <operation-id>"
                 );
             }
             return true;
@@ -82,6 +84,8 @@ public final class HistoryCommand implements CommandExecutor, TabCompleter {
                 case "undo" -> previewUndo(sender, args);
                 case "status" -> status(sender);
                 case "storage" -> storage(sender);
+                case "resume" -> resume(sender);
+                case "recover" -> recover(sender, args);
                 case "teleport" -> teleport(sender, args);
                 default -> {
                     sender.sendMessage(HistoryUi.prefixed(Component.text(
@@ -287,15 +291,24 @@ public final class HistoryCommand implements CommandExecutor, TabCompleter {
         Duration duration = args.length >= 3
             ? DurationParser.parse(args[2])
             : config.rollback().defaultDuration();
-        int radius = args.length >= 4 ? parseInteger(args[3], "반경") : config.rollback().defaultRadius();
-        if (radius < 1 || radius > config.rollback().maxRadius()) {
-            throw new IllegalArgumentException("반경은 1~" + config.rollback().maxRadius() + " 사이여야 합니다.");
+        String scope = args.length >= 4 ? args[3] : Integer.toString(config.rollback().defaultRadius());
+        boolean global = scope.equalsIgnoreCase("global") || scope.equalsIgnoreCase("world");
+        int radius = global ? config.rollback().defaultRadius() : parseInteger(scope, "반경");
+        if (!global && (radius < 1 || radius > config.rollback().maxRadius())) {
+            throw new IllegalArgumentException(
+                "반경은 1~" + config.rollback().maxRadius() + " 사이이거나 global이어야 합니다."
+            );
         }
         player.sendMessage(HistoryUi.prefixed(Component.text("안전한 되돌리기 범위를 계산하는 중…", NamedTextColor.GRAY)));
-        rollback.createRollbackPreview(player, actor, duration, radius)
+        CompletableFuture<RollbackPreview> previewFuture = global
+            ? rollback.createGlobalRollbackPreview(player, actor, duration)
+            : rollback.createRollbackPreview(player, actor, duration, radius);
+        previewFuture
             .whenComplete((preview, failure) -> onMain(player, failure, ignored -> {
                 player.sendMessage(HistoryUi.preview(preview));
-                sendQuickFilters(player, actor, radius);
+                if (!global) {
+                    sendQuickFilters(player, actor, radius);
+                }
             }));
         return true;
     }
@@ -349,7 +362,13 @@ public final class HistoryCommand implements CommandExecutor, TabCompleter {
 
     private boolean status(CommandSender sender) {
         requirePermission(sender, "history.status");
-        sender.sendMessage(HistoryUi.status(store.status()));
+        var status = store.status();
+        sender.sendMessage(HistoryUi.status(status));
+        if (status.interruptedOperations() > 0) {
+            store.interruptedOperationIds(10).whenComplete((ids, failure) ->
+                onMain(sender, failure, ignored -> sender.sendMessage(HistoryUi.interruptedOperations(ids)))
+            );
+        }
         return true;
     }
 
@@ -362,6 +381,40 @@ public final class HistoryCommand implements CommandExecutor, TabCompleter {
         store.storageProfile().whenComplete((profile, failure) -> onMain(sender, failure, ignored ->
             sender.sendMessage(HistoryUi.storageProfile(profile))
         ));
+        return true;
+    }
+
+    private boolean resume(CommandSender sender) {
+        requirePermission(sender, "history.admin");
+        sender.sendMessage(HistoryUi.prefixed(Component.text(
+            "대기 기록과 저장소 상태를 검증하는 중…",
+            NamedTextColor.GRAY
+        )));
+        store.resumeCapture().whenComplete((result, failure) -> onMain(sender, failure, ignored ->
+            sender.sendMessage(HistoryUi.captureRecovery(result))
+        ));
+        return true;
+    }
+
+    private boolean recover(CommandSender sender, String[] args) {
+        Player player = requirePlayer(sender);
+        requirePermission(player, "history.admin");
+        if (args.length != 2) {
+            throw new IllegalArgumentException("사용법: /history recover <operation-id>");
+        }
+        UUID operationId;
+        try {
+            operationId = UUID.fromString(args[1]);
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalArgumentException("작업 ID가 올바르지 않습니다.", exception);
+        }
+        player.sendMessage(HistoryUi.prefixed(Component.text(
+            "중단 작업의 DB 체크포인트와 현재 블록 상태를 대조하는 중…",
+            NamedTextColor.YELLOW
+        )));
+        rollback.recover(player, operationId).whenComplete((result, failure) ->
+            onMain(player, failure, ignored -> player.sendMessage(HistoryUi.operationResult(result)))
+        );
         return true;
     }
 
@@ -558,7 +611,10 @@ public final class HistoryCommand implements CommandExecutor, TabCompleter {
                 return matching(List.of("5m", "15m", "1h", "6h", "1d"), args[2]);
             }
             if (args.length == 4) {
-                return matching(List.of("5", "10", "25", "50", "100", "1000", "10000"), args[3]);
+                return matching(
+                    List.of("5", "10", "25", "50", "100", "1000", "10000", "global"),
+                    args[3]
+                );
             }
         }
         if (args[0].equalsIgnoreCase("search")) {

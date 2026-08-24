@@ -46,8 +46,10 @@ public record HistoryConfig(
             databaseFile,
             postgres,
             boundedInt(source, "storage.queue-capacity", 1_000, 1_000_000),
+            boundedIntDefault(source, "storage.worldedit-queue-capacity", 131_072, 4_096, 1_000_000),
             boundedInt(source, "storage.batch-size", 1, 10_000),
             boundedInt(source, "storage.flush-interval-ms", 10, 5_000),
+            boundedIntDefault(source, "storage.worldedit-admission-timeout-ms", 30_000, 1_000, 300_000),
             boundedIntFallback(source, "storage.sqlite.busy-timeout-ms", "storage.busy-timeout-ms", 100, 60_000),
             boundedIntDefault(source, "storage.retention.days", 0, 0, 36_500),
             boundedIntDefault(source, "storage.retention.purge-batch-size", 10_000, 100, 1_000_000),
@@ -87,18 +89,27 @@ public record HistoryConfig(
         if (defaultRadius > maxRadius) {
             throw new ConfigException("rollback.default-radius must not exceed rollback.max-radius");
         }
+        boolean restoreBlockEntityData = source.getBoolean("rollback.restore-block-entity-data", false);
+        if (restoreBlockEntityData) {
+            throw new ConfigException(
+                "rollback.restore-block-entity-data=true is not available: safe atomic block-entity restoration "
+                    + "is not implemented"
+            );
+        }
         Rollback rollback = new Rollback(
             defaultDuration,
             defaultRadius,
             maxRadius,
             boundedInt(source, "rollback.max-source-changes", 1, 1_000_000),
             boundedIntDefault(source, "rollback.max-chunks-per-operation", 256, 1, 10_000),
+            boundedIntDefault(source, "rollback.planning-fetch-size", 2_048, 128, 65_536),
+            boundedIntDefault(source, "rollback.operation-write-batch-size", 2_048, 128, 10_000),
             boundedIntDefault(source, "rollback.max-concurrent-chunk-leases", 4, 1, 32),
             boundedIntDefault(source, "rollback.chunk-load-timeout-seconds", 30, 5, 300),
             source.getBoolean("rollback.generate-missing-chunks", true),
             boundedInt(source, "rollback.blocks-per-tick", 1, 10_000),
             boundedInt(source, "rollback.preview-ttl-seconds", 10, 3_600),
-            source.getBoolean("rollback.restore-block-entity-data", false)
+            false
         );
         return new HistoryConfig(storage, logging, inspection, rollback);
     }
@@ -198,8 +209,10 @@ public record HistoryConfig(
         Path databaseFile,
         Postgres postgresql,
         int queueCapacity,
+        int worldEditQueueCapacity,
         int batchSize,
         int flushIntervalMillis,
+        int worldEditAdmissionTimeoutMillis,
         int busyTimeoutMillis,
         int retentionDays,
         int purgeBatchSize,
@@ -223,8 +236,10 @@ public record HistoryConfig(
                 databaseFile,
                 Postgres.defaults(),
                 queueCapacity,
+                Math.max(queueCapacity, 131_072),
                 batchSize,
                 flushIntervalMillis,
+                30_000,
                 busyTimeoutMillis,
                 0,
                 10_000,
@@ -327,6 +342,8 @@ public record HistoryConfig(
         int maxRadius,
         int maxSourceChanges,
         int maxChunksPerOperation,
+        int planningFetchSize,
+        int operationWriteBatchSize,
         int maxConcurrentChunkLeases,
         int chunkLoadTimeoutSeconds,
         boolean generateMissingChunks,

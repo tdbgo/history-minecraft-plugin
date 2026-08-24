@@ -17,9 +17,15 @@ History reduces repeated data before it is stored:
 
 ## Backpressure
 
-Direct changes and FAWE changes use separate bounded queues, so a large edit cannot consume the headroom reserved for players and server events. `storage.queue-capacity` applies to each lane.
+Direct changes and FAWE changes use separate bounded queues, so a large edit cannot consume the headroom reserved for players and server events. `storage.queue-capacity` bounds direct capture. `storage.worldedit-queue-capacity` independently bounds WorldEdit and FAWE capture.
 
-FAWE workers apply backpressure when their queue reaches its bound. They resume as the database writer drains records instead of dropping history. Direct server-thread capture never waits for a database round trip; a direct-queue overflow or storage failure remains visible through `/history status` rather than being reported as persisted.
+History observes FAWE only in post-processing. It never holds queue permits across FAWE callbacks and never throws a History capacity error into `set`, `cut`, `paste`, `stack`, `move`, `regen`, `undo`, or `redo`. One applied chunk is admitted to the bounded queue as an all-or-none batch. If storage cannot admit it immediately, the edit remains intact and History records a visible capture gap.
+
+The WorldEdit fallback delegates the mutation first and then performs a non-blocking capture attempt. A History failure is not propagated through the edit path.
+
+Direct server-thread capture never waits for a database round trip. Under sustained pressure, History expands database batches up to 8,192 records while preserving the separate queue lanes. If the direct lane still overflows, that record becomes a visible capture gap while later changes continue to be attempted. After the queue drains and storage is healthy, `/history resume` verifies the store and clears the active degraded state without erasing cumulative gap counters.
+
+Rollback queries do not use a total row or chunk cap. Matching rows are read with a bounded database fetch size, consolidated one block position at a time, and written to a verified temporary plan. The durable operation is then prepared in bounded batches and applied one exact chunk at a time. History checkpoints that chunk before loading the next one. If execution stops after world application but before a checkpoint is acknowledged, `/history recover <operation-id>` rebuilds the pending spool from the database and reconciles live `before`/`after` state. This keeps memory proportional to a database page and one target chunk instead of the total rollback area.
 
 Place PostgreSQL on a reliable, low-latency network. Do not use a distant public-network database only to save local disk.
 
@@ -41,4 +47,6 @@ To use PostgreSQL, set `storage.backend: postgresql`. Prefer `password-env` over
 
 History does not automatically import CoreProtect data or transfer records between SQLite and PostgreSQL. Select the intended backend before production use.
 
-Monitor accepted, persisted, merged, rejected, queued, and purged counts. PostgreSQL operators should also monitor commit latency, WAL generation, and autovacuum lag.
+Monitor accepted, persisted, merged, direct rejects, capture-gap events/changes, database queue, pending external edits, interrupted operations, and purged counts. PostgreSQL operators should also monitor commit latency, WAL generation, and autovacuum lag.
+
+The in-process ingress queues are not a crash-proof write-ahead log. An unclean JVM or host failure can lose an accepted but not yet committed tail. This alpha reports detected pressure gaps, but a durable local ingress journal and idempotent PostgreSQL projection remain future hardening work.

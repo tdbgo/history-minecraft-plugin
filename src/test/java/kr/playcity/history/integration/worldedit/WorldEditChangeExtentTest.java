@@ -35,6 +35,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class WorldEditChangeExtentTest {
@@ -73,6 +74,73 @@ class WorldEditChangeExtentTest {
         }
     }
 
+    @Test
+    void preservesFallbackWorldEditWhenHistoryCannotRecordIt() throws Exception {
+        BlockVector3 position = BlockVector3.at(4, 70, -8);
+        BlockState stone = state("minecraft:stone");
+        BlockState dirt = state("minecraft:dirt");
+        MemoryExtent memory = new MemoryExtent();
+        memory.setBlock(position, stone);
+        CapturingStore store = new CapturingStore(false);
+        WorldEditChangeExtent extent = new WorldEditChangeExtent(
+            memory,
+            UUID.randomUUID(),
+            ActorRef.player(UUID.randomUUID(), "Builder"),
+            UUID.randomUUID(),
+            new ChangeRecorder(store, Logger.getAnonymousLogger())
+        );
+
+        assertTrue(extent.setBlock(position, dirt));
+
+        assertEquals("minecraft:dirt", memory.getBlock(position).getAsString());
+        assertTrue(store.changes.isEmpty());
+    }
+
+    @Test
+    void preservesFallbackWorldEditWhenHistoryRecordingThrows() throws Exception {
+        BlockVector3 position = BlockVector3.at(6, 71, -9);
+        BlockState stone = state("minecraft:stone");
+        BlockState dirt = state("minecraft:dirt");
+        MemoryExtent memory = new MemoryExtent();
+        memory.setBlock(position, stone);
+        CapturingStore store = new CapturingStore(true, true);
+        WorldEditChangeExtent extent = new WorldEditChangeExtent(
+            memory,
+            UUID.randomUUID(),
+            ActorRef.player(UUID.randomUUID(), "Builder"),
+            UUID.randomUUID(),
+            new ChangeRecorder(store, Logger.getAnonymousLogger())
+        );
+
+        assertTrue(extent.setBlock(position, dirt));
+
+        assertEquals("minecraft:dirt", memory.getBlock(position).getAsString());
+        assertTrue(store.changes.isEmpty());
+    }
+
+    @Test
+    void doesNotRecordWhenDelegateDoesNotChangeTheWorld() throws Exception {
+        BlockVector3 position = BlockVector3.at(7, 80, 9);
+        BlockState stone = state("minecraft:stone");
+        BlockState dirt = state("minecraft:dirt");
+        MemoryExtent memory = new MemoryExtent();
+        memory.setBlock(position, stone);
+        memory.acceptMutations = false;
+        CapturingStore store = new CapturingStore();
+        WorldEditChangeExtent extent = new WorldEditChangeExtent(
+            memory,
+            UUID.randomUUID(),
+            ActorRef.player(UUID.randomUUID(), "Builder"),
+            UUID.randomUUID(),
+            new ChangeRecorder(store, Logger.getAnonymousLogger())
+        );
+
+        assertFalse(extent.setBlock(position, dirt));
+
+        assertEquals("minecraft:stone", memory.getBlock(position).getAsString());
+        assertTrue(store.changes.isEmpty());
+    }
+
     private static BlockState state(String id) throws Exception {
         Constructor<BlockState> constructor = BlockState.class.getDeclaredConstructor(
             BlockType.class,
@@ -85,6 +153,7 @@ class WorldEditChangeExtentTest {
 
     private static final class MemoryExtent implements Extent {
         private final Map<BlockVector3, BlockState> states = new HashMap<>();
+        private boolean acceptMutations = true;
 
         @Override
         public BlockVector3 getMinimumPoint() {
@@ -128,6 +197,9 @@ class WorldEditChangeExtentTest {
         @Override
         public <T extends BlockStateHolder<T>> boolean setBlock(BlockVector3 position, T block)
             throws WorldEditException {
+            if (!acceptMutations) {
+                return false;
+            }
             BlockState target = block.toImmutableState();
             BlockState previous = states.put(position, target);
             return previous == null || !previous.getAsString().equals(target.getAsString());
@@ -141,9 +213,39 @@ class WorldEditChangeExtentTest {
 
     private static final class CapturingStore implements HistoryStore {
         private final List<ChangeRecord> changes = new ArrayList<>();
+        private final boolean accepting;
+        private final boolean throwOnRecord;
+
+        private CapturingStore() {
+            this(true, false);
+        }
+
+        private CapturingStore(boolean accepting) {
+            this(accepting, false);
+        }
+
+        private CapturingStore(boolean accepting, boolean throwOnRecord) {
+            this.accepting = accepting;
+            this.throwOnRecord = throwOnRecord;
+        }
 
         @Override
         public boolean append(ChangeRecord change) {
+            if (!accepting) {
+                return false;
+            }
+            changes.add(change);
+            return true;
+        }
+
+        @Override
+        public boolean tryAppendWorldEdit(ChangeRecord change) {
+            if (throwOnRecord) {
+                throw new IllegalStateException("injected History failure");
+            }
+            if (!accepting) {
+                return false;
+            }
             changes.add(change);
             return true;
         }
@@ -175,7 +277,22 @@ class WorldEditChangeExtentTest {
 
         @Override
         public StoreStatus status() {
-            throw new UnsupportedOperationException();
+            return new StoreStatus(
+                "test",
+                true,
+                accepting,
+                true,
+                true,
+                0,
+                changes.size(),
+                changes.size(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                ""
+            );
         }
 
         @Override

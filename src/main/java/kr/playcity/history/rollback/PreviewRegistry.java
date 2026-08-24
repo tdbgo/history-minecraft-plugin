@@ -1,18 +1,19 @@
 package kr.playcity.history.rollback;
 
+import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-public final class PreviewRegistry {
+public final class PreviewRegistry implements AutoCloseable {
     private static final char[] TOKEN_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz".toCharArray();
     private static final int TOKEN_LENGTH = 10;
     private final SecureRandom random = new SecureRandom();
-    private final Map<String, RollbackPreview> previews = new ConcurrentHashMap<>();
+    private final Map<String, PreparedRollbackPreview> previews = new ConcurrentHashMap<>();
 
-    public RollbackPreview register(RollbackPreview preview) {
+    public RollbackPreview register(RollbackPreview preview, Path planFile) {
         purgeExpired();
         String token;
         do {
@@ -25,32 +26,55 @@ public final class PreviewRegistry {
             preview.kind(),
             preview.summary(),
             preview.inverseOf(),
-            preview.items(),
+            preview.itemCount(),
+            preview.chunkCount(),
             preview.sourceChanges(),
             preview.conflicts(),
-            preview.alreadyTarget(),
-            preview.sourceLimitReached()
+            preview.alreadyTarget()
         );
-        previews.put(token, registered);
+        previews.put(token, new PreparedRollbackPreview(registered, planFile));
         return registered;
     }
 
-    public Optional<RollbackPreview> consume(String token, UUID ownerId) {
-        RollbackPreview preview = previews.remove(token);
-        if (preview == null || !preview.ownerId().equals(ownerId) || preview.expiresAt() < System.currentTimeMillis()) {
+    public Optional<PreparedRollbackPreview> consume(String token, UUID ownerId) {
+        PreparedRollbackPreview prepared = previews.remove(token);
+        if (prepared == null) {
             return Optional.empty();
         }
-        return Optional.of(preview);
+        RollbackPreview preview = prepared.preview();
+        if (!preview.ownerId().equals(ownerId) || preview.expiresAt() < System.currentTimeMillis()) {
+            OperationPlanSpool.delete(prepared.planFile());
+            return Optional.empty();
+        }
+        return Optional.of(prepared);
     }
 
     public boolean cancel(String token, UUID ownerId) {
-        RollbackPreview preview = previews.get(token);
-        return preview != null && preview.ownerId().equals(ownerId) && previews.remove(token, preview);
+        PreparedRollbackPreview prepared = previews.get(token);
+        if (prepared == null || !prepared.preview().ownerId().equals(ownerId)
+            || !previews.remove(token, prepared)) {
+            return false;
+        }
+        OperationPlanSpool.delete(prepared.planFile());
+        return true;
     }
 
     private void purgeExpired() {
         long now = System.currentTimeMillis();
-        previews.entrySet().removeIf(entry -> entry.getValue().expiresAt() < now);
+        previews.entrySet().removeIf(entry -> {
+            PreparedRollbackPreview prepared = entry.getValue();
+            if (prepared.preview().expiresAt() >= now) {
+                return false;
+            }
+            OperationPlanSpool.delete(prepared.planFile());
+            return true;
+        });
+    }
+
+    @Override
+    public void close() {
+        previews.values().forEach(prepared -> OperationPlanSpool.delete(prepared.planFile()));
+        previews.clear();
     }
 
     private String newToken() {

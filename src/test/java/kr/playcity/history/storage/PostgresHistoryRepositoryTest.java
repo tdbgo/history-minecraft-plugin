@@ -7,6 +7,11 @@ import kr.playcity.history.model.BlockSnapshot;
 import kr.playcity.history.model.ChangeCause;
 import kr.playcity.history.model.ChangeRecord;
 import kr.playcity.history.model.HistoryQuery;
+import kr.playcity.history.model.AppliedOperationItem;
+import kr.playcity.history.model.OperationCheckpoint;
+import kr.playcity.history.model.OperationHeader;
+import kr.playcity.history.model.OperationItem;
+import kr.playcity.history.model.OperationKind;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,6 +22,7 @@ import java.sql.DriverManager;
 import java.sql.Statement;
 import java.sql.ResultSet;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
@@ -138,6 +144,57 @@ class PostgresHistoryRepositoryTest {
             assertEquals(3L, scalar(statement, "SELECT version FROM schema_info"));
             assertEquals(1L, scalar(statement, "SELECT SUM(change_count) FROM storage_metrics"));
         }
+    }
+
+    @Test
+    void streamsPendingItemsAndCheckpointsIdempotently() {
+        UUID operationId = UUID.randomUUID();
+        List<OperationItem> items = new ArrayList<>();
+        for (int sequence = 0; sequence < 50; sequence++) {
+            items.add(new OperationItem(
+                sequence,
+                new BlockPosition(WORLD_ID, sequence, 64, 0),
+                BlockSnapshot.block("minecraft:stone"),
+                BlockSnapshot.block("minecraft:dirt"),
+                List.of((long) sequence + 1L)
+            ));
+        }
+        repository.prepareOperation(
+            new OperationHeader(operationId, 1_000L, ACTOR, OperationKind.ROLLBACK, "recovery", null, items.size()),
+            new OperationItemSource() {
+                private int cursor;
+
+                @Override
+                public List<OperationItem> readBatch(int maximumItems) {
+                    if (cursor == items.size()) {
+                        return List.of();
+                    }
+                    int end = Math.min(items.size(), cursor + maximumItems);
+                    List<OperationItem> batch = List.copyOf(items.subList(cursor, end));
+                    cursor = end;
+                    return batch;
+                }
+
+                @Override
+                public void close() {
+                }
+            },
+            7
+        );
+        assertEquals(List.of(operationId), repository.interruptedOperationIds(10));
+        List<AppliedOperationItem> first = items.subList(0, 8).stream()
+            .map(item -> new AppliedOperationItem(item, item.before(), item.after()))
+            .toList();
+        OperationCheckpoint checkpoint = new OperationCheckpoint(operationId, 2_000L, first);
+        repository.checkpointOperation(checkpoint);
+        repository.checkpointOperation(checkpoint);
+
+        List<OperationItem> pending = new ArrayList<>();
+        repository.scanPendingOperationItems(operationId, pending::add);
+        assertEquals(42, pending.size());
+        assertEquals(8, pending.getFirst().sequence());
+        assertEquals(49, pending.getLast().sequence());
+        assertEquals(8, repository.loadOperationSummary(operationId).orElseThrow().appliedCount());
     }
 
     private static ChangeRecord change(long time, int x, String before, String after) {

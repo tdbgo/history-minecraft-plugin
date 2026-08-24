@@ -33,8 +33,8 @@ final class FaweEditSessionBridge {
             recorder,
             logger
         );
-        IBatchProcessor existing = queue.getProcessor();
-        queue.setProcessor(existing == null ? history : existing.join(history));
+        IBatchProcessor existingPost = queue.getPostProcessor();
+        queue.setPostProcessor(existingPost == null ? history : history.joinPost(existingPost));
         return true;
     }
 }

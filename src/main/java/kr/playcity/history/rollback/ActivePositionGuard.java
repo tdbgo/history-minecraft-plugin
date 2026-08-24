@@ -37,6 +37,15 @@ public final class ActivePositionGuard {
         return result.value;
     }
 
+    /** Marks a mutation boundary without performing queue work. */
+    public void markMutation(BlockPosition position) {
+        Objects.requireNonNull(position, "position");
+        active.computeIfPresent(position, (ignored, slot) -> {
+            slot.generation++;
+            return slot;
+        });
+    }
+
     public Watch watch(Collection<BlockPosition> positions) {
         Objects.requireNonNull(positions, "positions");
         Set<BlockPosition> unique = new HashSet<>(positions);

@@ -2,24 +2,38 @@ package kr.playcity.history.storage;
 
 import kr.playcity.history.config.HistoryConfig;
 import kr.playcity.history.model.ActorRef;
+import kr.playcity.history.model.AppliedOperationItem;
 import kr.playcity.history.model.BlockPosition;
 import kr.playcity.history.model.BlockSnapshot;
 import kr.playcity.history.model.ChangeCause;
 import kr.playcity.history.model.ChangeRecord;
 import kr.playcity.history.model.HistoryQuery;
+import kr.playcity.history.model.OperationCompletion;
+import kr.playcity.history.model.OperationCheckpoint;
+import kr.playcity.history.model.OperationDraft;
+import kr.playcity.history.model.OperationItem;
+import kr.playcity.history.model.StoredOperation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 class AsyncHistoryStoreTest {
     @TempDir
@@ -81,8 +95,10 @@ class AsyncHistoryStoreTest {
             temporaryDirectory.resolve("unused.db"),
             unavailable,
             1,
+            1,
             2,
             5_000,
+            30_000,
             1_000,
             0,
             10_000,
@@ -104,8 +120,10 @@ class AsyncHistoryStoreTest {
 
         assertTrue(store.append(change));
         assertFalse(store.append(change));
-        assertFalse(store.status().accepting());
-        assertFalse(store.status().healthy());
+        assertTrue(store.status().accepting());
+        assertTrue(store.status().degraded());
+        assertFalse(store.status().captureComplete());
+        assertFalse(store.status().operational());
         assertEquals(1L, store.status().rejected());
         store.closeAsync().get(5, TimeUnit.SECONDS);
     }
@@ -190,6 +208,419 @@ class AsyncHistoryStoreTest {
             assertTrue(store.status().healthy());
         } finally {
             store.closeAsync().get(Duration.ofSeconds(10).toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    @Test
+    void preservesQueueOverflowAfterDrainUntilExplicitRecovery() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("overflow-recovery.db"),
+            8,
+            1,
+            20,
+            1_000
+        );
+        TestRepository repository = new TestRepository(true, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+
+            assertTrue(store.append(change(0)));
+            assertTrue(repository.firstInsertStarted.await(2, TimeUnit.SECONDS));
+            for (int index = 1; index <= 8; index++) {
+                assertTrue(store.append(change(index)));
+            }
+            assertFalse(store.append(change(9)));
+            assertTrue(store.status().accepting());
+            assertTrue(store.status().degraded());
+            assertFalse(store.status().captureComplete());
+            assertFalse(store.status().operational());
+            assertEquals(1L, store.status().rejected());
+
+            repository.releaseFirstInsert.countDown();
+            await(
+                () -> store.status().queued() == 0 && store.status().persisted() == 9,
+                Duration.ofSeconds(5)
+            );
+
+            StoreStatus drained = store.status();
+            assertTrue(drained.healthy());
+            assertTrue(drained.accepting());
+            assertTrue(drained.degraded());
+            assertFalse(drained.captureComplete());
+            assertTrue(drained.recoveryAvailable());
+            assertTrue(drained.lastError().contains("포화"));
+            assertTrue(repository.maximumBatchSize() > config.batchSize());
+
+            CaptureRecoveryResult recovery = store.resumeCapture().get(5, TimeUnit.SECONDS);
+            assertTrue(recovery.resumed());
+            assertTrue(store.status().accepting());
+            assertFalse(store.status().captureComplete());
+            assertFalse(store.status().degraded());
+            assertTrue(store.status().operational());
+            assertTrue(store.append(change(10)));
+            await(() -> store.status().persisted() == 10, Duration.ofSeconds(5));
+        } finally {
+            repository.releaseFirstInsert.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void recoversTransientRepositoryFailureWithoutCreatingCaptureGap() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("transient-storage.db"),
+            8,
+            1,
+            20,
+            1_000
+        );
+        TestRepository repository = new TestRepository(false, 1);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            assertTrue(store.append(change(0)));
+            await(() -> store.status().persisted() == 1, Duration.ofSeconds(5));
+
+            StoreStatus recovered = store.status();
+            assertTrue(recovered.healthy());
+            assertTrue(recovered.accepting());
+            assertTrue(recovered.captureComplete());
+            assertTrue(recovered.operational());
+            assertEquals(0L, recovered.rejected());
+            assertEquals("", recovered.lastError());
+            assertEquals(2, repository.insertAttempts.get());
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void timesOutWorldEditBeforeApplicationWithoutReportingAHistoryGap() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            kr.playcity.history.config.StorageBackend.SQLITE,
+            temporaryDirectory.resolve("worldedit-timeout.db"),
+            HistoryConfig.Postgres.defaults(),
+            1,
+            1,
+            1,
+            20,
+            50,
+            1_000,
+            0,
+            10_000,
+            60
+        );
+        TestRepository repository = new TestRepository(true, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            assertTrue(store.appendWorldEdit(change(0)));
+            assertTrue(repository.firstInsertStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(store.appendWorldEdit(change(1)));
+            assertFalse(store.appendWorldEdit(change(2)));
+
+            StoreStatus blocked = store.status();
+            assertEquals(1L, blocked.blockedWorldEdits());
+            assertEquals(0L, blocked.rejected());
+            assertFalse(blocked.captureComplete());
+            assertTrue(blocked.degraded());
+            assertTrue(blocked.accepting());
+            assertTrue(blocked.lastError().contains("대기열"));
+        } finally {
+            repository.releaseFirstInsert.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void worldEditFallbackFailsImmediatelyInsteadOfBlockingTheServerThread() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            kr.playcity.history.config.StorageBackend.SQLITE,
+            temporaryDirectory.resolve("worldedit-nonblocking.db"),
+            HistoryConfig.Postgres.defaults(),
+            1,
+            1,
+            1,
+            20,
+            300_000,
+            1_000,
+            0,
+            10_000,
+            60
+        );
+        TestRepository repository = new TestRepository(true, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            assertTrue(store.tryAppendWorldEdit(change(0)));
+            assertTrue(repository.firstInsertStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(store.tryAppendWorldEdit(change(1)));
+
+            long started = System.nanoTime();
+            assertFalse(store.tryAppendWorldEdit(change(2)));
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+            assertTrue(elapsedMillis < 2_000L);
+            assertEquals(1L, store.status().blockedWorldEdits());
+            assertEquals(0L, store.status().rejected());
+            assertFalse(store.status().captureComplete());
+            assertTrue(store.status().degraded());
+        } finally {
+            repository.releaseFirstInsert.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void admitsAppliedFaweChunkAsOneBoundedBatchWithoutAReservationLifecycle() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            kr.playcity.history.config.StorageBackend.SQLITE,
+            temporaryDirectory.resolve("fawe-batch-reservation.db"),
+            HistoryConfig.Postgres.defaults(),
+            1,
+            2,
+            1,
+            20,
+            1_000,
+            1_000,
+            0,
+            10_000,
+            60
+        );
+        TestRepository repository = new TestRepository(false, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            assertFalse(store.tryAppendWorldEditBatch(List.of(change(10), change(11), change(12))));
+            assertEquals(0L, store.status().accepted());
+            assertEquals(0, store.status().pendingReservations());
+            assertEquals(1L, store.status().captureGapEvents());
+
+            assertTrue(store.tryAppendWorldEditBatch(List.of(change(0), change(1))));
+
+            await(() -> store.status().persisted() == 2, Duration.ofSeconds(5));
+            assertEquals(2L, store.status().accepted());
+            assertEquals(2L, store.status().persisted());
+            assertEquals(0, store.status().pendingReservations());
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void externalCaptureLifecycleIsIdempotentAndDiagnosesAbandonment() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("external-capture.db"), 8, 2, 20, 1_000
+        );
+        TestRepository repository = new TestRepository(false, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            UUID completed = UUID.randomUUID();
+            store.beginExternalCapture(completed, 42, "fawe");
+            assertEquals(1, store.status().pendingReservations());
+            assertEquals(42L, store.status().pendingReservationChanges());
+            assertEquals(completed.toString(), store.status().oldestReservationId());
+            store.completeExternalCapture(completed);
+            store.completeExternalCapture(completed);
+            assertEquals(0, store.status().pendingReservations());
+            assertEquals(0L, store.status().captureGapEvents());
+
+            UUID abandoned = UUID.randomUUID();
+            store.beginExternalCapture(abandoned, 17, "fawe");
+            store.abandonExternalCapture(abandoned, "test cancellation");
+            store.abandonExternalCapture(abandoned, "duplicate cancellation");
+            assertEquals(0, store.status().pendingReservations());
+            assertEquals(1L, store.status().captureGapEvents());
+            assertEquals(17L, store.status().worldEditCaptureGapChanges());
+            assertTrue(store.status().degraded());
+            assertTrue(store.resumeCapture().get(5, TimeUnit.SECONDS).resumed());
+            assertFalse(store.status().degraded());
+            assertEquals(1L, store.status().captureGapEvents());
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void retriesDurableOperationCheckpointUntilStorageRecovers() throws Exception {
+        TestRepository repository = new TestRepository(false, 0);
+        repository.operationFailuresRemaining.set(2);
+        HistoryConfig.Storage operationConfig = new HistoryConfig.Storage(
+            kr.playcity.history.config.StorageBackend.SQLITE,
+            temporaryDirectory.resolve("operation-retry.db"),
+            HistoryConfig.Postgres.defaults(),
+            8,
+            8,
+            4,
+            20,
+            1_000,
+            1_000,
+            0,
+            10_000,
+            60
+        );
+        AsyncHistoryStore store = new AsyncHistoryStore(
+            operationConfig,
+            Logger.getAnonymousLogger(),
+            repository
+        );
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            OperationItem item = new OperationItem(
+                0,
+                change(0).position(),
+                BlockSnapshot.block("minecraft:stone"),
+                BlockSnapshot.block("minecraft:dirt"),
+                List.of(1L)
+            );
+            store.checkpointOperation(new OperationCheckpoint(
+                UUID.randomUUID(),
+                1_000L,
+                List.of(new AppliedOperationItem(item, item.before(), item.after()))
+            )).get(5, TimeUnit.SECONDS);
+
+            assertEquals(3, repository.operationAttempts.get());
+            assertTrue(store.status().healthy());
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private static ChangeRecord change(int index) {
+        return new ChangeRecord(
+            0L,
+            100L + index,
+            new BlockPosition(UUID.fromString("11111111-1111-1111-1111-111111111111"), index, 64, 2),
+            ActorRef.player(UUID.fromString("22222222-2222-2222-2222-222222222222"), "Builder"),
+            ChangeCause.PLAYER_PLACE,
+            BlockSnapshot.air(),
+            BlockSnapshot.block("minecraft:stone"),
+            null,
+            ""
+        );
+    }
+
+    private static void await(BooleanSupplier condition, Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) {
+                fail("condition did not become true within " + timeout);
+            }
+            Thread.sleep(5L);
+        }
+    }
+
+    private static final class TestRepository implements HistoryRepository {
+        private final boolean blockFirstInsert;
+        private final AtomicInteger failuresRemaining;
+        private final CountDownLatch firstInsertStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseFirstInsert = new CountDownLatch(1);
+        private final AtomicInteger insertAttempts = new AtomicInteger();
+        private final AtomicLong persisted = new AtomicLong();
+        private final AtomicInteger operationFailuresRemaining = new AtomicInteger();
+        private final AtomicInteger operationAttempts = new AtomicInteger();
+        private final List<Integer> batchSizes = new ArrayList<>();
+
+        private TestRepository(boolean blockFirstInsert, int failures) {
+            this.blockFirstInsert = blockFirstInsert;
+            this.failuresRemaining = new AtomicInteger(failures);
+        }
+
+        @Override
+        public void open() {
+        }
+
+        @Override
+        public void insertBatch(List<ChangeRecord> changes) {
+            int attempt = insertAttempts.incrementAndGet();
+            firstInsertStarted.countDown();
+            if (blockFirstInsert && attempt == 1) {
+                try {
+                    if (!releaseFirstInsert.await(5, TimeUnit.SECONDS)) {
+                        throw new StorageException("test repository was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new StorageException("test repository was interrupted", interrupted);
+                }
+            }
+            if (failuresRemaining.getAndUpdate(value -> Math.max(0, value - 1)) > 0) {
+                throw new StorageException("transient test failure");
+            }
+            synchronized (batchSizes) {
+                batchSizes.add(changes.size());
+            }
+            persisted.addAndGet(changes.size());
+        }
+
+        @Override
+        public List<ChangeRecord> query(HistoryQuery query) {
+            return List.of();
+        }
+
+        @Override
+        public Map<BlockPosition, ChangeRecord> latestChanges(List<BlockPosition> positions) {
+            return Map.of();
+        }
+
+        @Override
+        public void prepareOperation(OperationDraft operation) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void checkpointOperation(OperationCheckpoint checkpoint) {
+            operationAttempts.incrementAndGet();
+            if (operationFailuresRemaining.getAndUpdate(value -> Math.max(0, value - 1)) > 0) {
+                throw new StorageException("transient operation failure");
+            }
+        }
+
+        @Override
+        public void completeOperation(OperationCompletion completion) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<StoredOperation> loadOperation(UUID operationId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<StoredOperation> findLastOperation(UUID actorId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public int interruptedOperationCount() {
+            return 0;
+        }
+
+        @Override
+        public int purgeChangesBefore(long cutoffMillis, int limit) {
+            return 0;
+        }
+
+        @Override
+        public StorageProfile storageProfile() {
+            return new StorageProfile("test", 0L, 0L, List.of());
+        }
+
+        @Override
+        public String backendName() {
+            return "test";
+        }
+
+        @Override
+        public void close() {
+        }
+
+        private int maximumBatchSize() {
+            synchronized (batchSizes) {
+                return batchSizes.stream().mapToInt(Integer::intValue).max().orElse(0);
+            }
         }
     }
 }

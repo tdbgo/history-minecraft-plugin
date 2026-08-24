@@ -3,11 +3,18 @@ config-version: 1
 storage:
   # sqlite or postgresql. Existing installations remain on SQLite.
   backend: sqlite
-  # Direct and FAWE capture have separate queues of this size. FAWE workers slow
-  # down when their lane is full instead of dropping rollback history.
+  # Direct player and server-event queue.
   queue-capacity: 50000
+  # Applied FAWE chunks are admitted atomically when they fit. History never
+  # blocks or partially applies the edit when this bounded capture lane is full.
+  worldedit-queue-capacity: 131072
+  # Normal transaction size. History scales this up to 8,192 records while a
+  # lane is under sustained pressure, then returns to this low-latency size.
   batch-size: 512
   flush-interval-ms: 50
+  # Retained for alpha configuration compatibility. Production capture paths do
+  # not wait on this value or abort WorldEdit/FAWE edits.
+  worldedit-admission-timeout-ms: 30000
   sqlite:
     file: history.db
     busy-timeout-ms: 5000
@@ -61,14 +68,15 @@ inspection:
 rollback:
   default-duration: 15m
   default-radius: 10
-  # Large spatial queries remain bounded by max-source-changes and exact chunk
-  # count; raising this does not cause every chunk inside the circle to load.
+  # Legacy alpha options retained for config compatibility. alpha.6 streams all
+  # matching records and one exact chunk at a time, so these are not hard caps.
   max-radius: 10000
   max-source-changes: 10000
-  # Hard containment boundary over exact chunks referenced by recorded changes.
-  # Unloaded and distant chunks inside this bound are restored; no surrounding
-  # cuboid or WorldEdit/FAWE restore operation is ever requested.
   max-chunks-per-operation: 256
+  # Bounded pages limit memory, not the total restore size.
+  planning-fetch-size: 2048
+  operation-write-batch-size: 2048
+  # No surrounding cuboid or WorldEdit/FAWE restore operation is requested.
   # Global pressure bound across simultaneous History operations. This limits
   # both in-flight loads and chunks currently held by a History ticket.
   max-concurrent-chunk-leases: 4
@@ -78,5 +86,6 @@ rollback:
   generate-missing-chunks: true
   blocks-per-tick: 250
   preview-ttl-seconds: 120
-  # Disabled until dropped/picked-up item reconciliation is implemented.
+  # Must remain false. Startup rejects true until block-entity application,
+  # item reconciliation, compensation, and recovery are atomic.
   restore-block-entity-data: false

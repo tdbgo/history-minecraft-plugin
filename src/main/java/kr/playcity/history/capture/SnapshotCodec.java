@@ -9,6 +9,7 @@ import org.bukkit.block.Block;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.Chest;
 import org.bukkit.block.Sign;
+import org.bukkit.block.TileState;
 import org.bukkit.block.sign.Side;
 import org.bukkit.block.sign.SignSide;
 import org.bukkit.inventory.Inventory;
@@ -24,6 +25,7 @@ import java.io.IOException;
 public final class SnapshotCodec {
     static final String INVENTORY_V1 = "inventory/v1";
     static final String SIGN_V1 = "sign/v1";
+    static final String UNSUPPORTED_TILE_V1 = "unsupported-tile/v1";
 
     public BlockSnapshot capture(Block block) {
         return capture(block.getState(false));
@@ -42,6 +44,11 @@ public final class SnapshotCodec {
                     INVENTORY_V1,
                     ItemStack.serializeItemsAsBytes(inventory.getContents())
                 );
+            }
+            if (state instanceof TileState) {
+                // Preserve an explicit boundary so rollback planning never
+                // mistakes an uncaptured block entity for an ordinary block.
+                return new BlockSnapshot(blockData, UNSUPPORTED_TILE_V1, new byte[0]);
             }
             return BlockSnapshot.block(blockData);
         } catch (RuntimeException | IOException exception) {

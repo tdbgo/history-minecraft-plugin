@@ -9,9 +9,9 @@ used only while compiling, or connected to optionally at runtime.
 | PostgreSQL JDBC Driver 42.7.13 | Optional PostgreSQL driver | BSD-2-Clause | Yes |
 | OnGres SCRAM client/common 3.2 | Shaded in PostgreSQL JDBC | BSD-2-Clause | Yes |
 | OnGres SASLprep/Stringprep 2.2 | Shaded in PostgreSQL JDBC | BSD-2-Clause | Yes |
-| Paper API 26.2 | Compile-time server API | GPL-3.0 | No |
-| WorldEdit API 7.4.4 | Compile-time optional integration API | GPL-3.0-only | No |
-| FastAsyncWorldEdit 2.15.3 | Compile-time optional batch API and optional runtime integration | GPL-3.0-only | No |
+| Paper API 26.2 | Compile-time server API | GPL-3.0, with MIT grants from listed contributors | No |
+| WorldEdit API 7.4.4 | Compile-time optional integration API | GPL-3.0-or-later | No |
+| FastAsyncWorldEdit 2.15.3 | Compile-time optional batch API and optional runtime integration | GPL-3.0 | No |
 | JUnit Jupiter 5.13.4 | Tests | EPL-2.0 | No |
 | SLF4J Simple 2.0.17 | Tests | MIT | No |
 

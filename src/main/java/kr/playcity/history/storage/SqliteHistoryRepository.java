@@ -9,10 +9,14 @@ import kr.playcity.history.model.ChangeCause;
 import kr.playcity.history.model.ChangeRecord;
 import kr.playcity.history.model.HistoryQuery;
 import kr.playcity.history.model.OperationCompletion;
+import kr.playcity.history.model.OperationCheckpoint;
 import kr.playcity.history.model.OperationDraft;
+import kr.playcity.history.model.OperationFinalization;
+import kr.playcity.history.model.OperationHeader;
 import kr.playcity.history.model.OperationItem;
 import kr.playcity.history.model.OperationKind;
 import kr.playcity.history.model.OperationStatus;
+import kr.playcity.history.model.OperationSummary;
 import kr.playcity.history.model.StoredOperation;
 
 import java.nio.ByteBuffer;
@@ -34,6 +38,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -579,6 +584,122 @@ final class SqliteHistoryRepository implements HistoryRepository {
     }
 
     @Override
+    public void scanRollbackChanges(HistoryQuery query, ChangeRecordSink sink) {
+        Objects.requireNonNull(query, "query");
+        Objects.requireNonNull(sink, "sink");
+        if (!query.rollbackOnly() || query.hasCursor()) {
+            throw new IllegalArgumentException("Streaming scans require an unpaged rollback query");
+        }
+        Long worldId = findWorldId(query.worldId());
+        if (worldId == null) {
+            return;
+        }
+        StringBuilder sql = new StringBuilder("""
+            SELECT c.id, c.occurred_at, c.chunk_x, c.chunk_z, c.packed_position,
+                   a.uuid AS actor_uuid, a.name AS actor_name, a.kind AS actor_kind,
+                   c.cause,
+                   bs1.block_data AS before_data,
+                   bs1.payload_type AS before_payload_type,
+                   bs1.payload AS before_payload,
+                   bs2.block_data AS after_data,
+                   bs2.payload_type AS after_payload_type,
+                   bs2.payload AS after_payload,
+                   c.operation_uuid, eb.uuid AS batch_uuid, c.metadata
+              FROM changes c
+              JOIN actors a ON a.id = c.actor_id
+              JOIN block_states bs1 ON bs1.id = c.before_state_id
+              JOIN block_states bs2 ON bs2.id = c.after_state_id
+              LEFT JOIN edit_batches eb ON eb.id = c.batch_id
+             WHERE c.world_id = ? AND c.occurred_at >= ?
+            """);
+        appendSpatialFilter(sql, query, false);
+        boolean filterActor = query.actor() != null;
+        UUID actorUuid = filterActor ? parseUuid(query.actor()) : null;
+        if (actorUuid != null) {
+            sql.append(" AND a.uuid = ?");
+        } else if (filterActor) {
+            sql.append(" AND a.name = ? COLLATE NOCASE");
+        }
+        if (query.cause() != null) {
+            sql.append(" AND c.cause = ?");
+        }
+        RollbackCauseFilterSql.append(sql, query);
+        MaterialFilterSql.append(sql, query);
+        sql.append(" ORDER BY c.chunk_x, c.chunk_z, c.packed_position, c.occurred_at DESC, c.id DESC");
+
+        try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            statement.setFetchSize(query.limit());
+            int parameter = bindQueryPrefix(statement, worldId, query, actorUuid, filterActor, false);
+            RollbackCauseFilterSql.bind(statement, parameter, query);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    sink.accept(readChange(result, query.worldId()));
+                }
+            }
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to stream SQLite rollback changes", exception);
+        }
+    }
+
+    private static void appendSpatialFilter(StringBuilder sql, HistoryQuery query, boolean postgres) {
+        if (query.exactPosition()) {
+            sql.append(" AND c.chunk_x = ? AND c.chunk_z = ? AND c.packed_position = ?");
+            return;
+        }
+        sql.append(" AND c.chunk_x BETWEEN ? AND ? AND c.chunk_z BETWEEN ? AND ?");
+        String chunkX = postgres ? "(c.chunk_x::bigint * 16)" : "(c.chunk_x * 16)";
+        String chunkZ = postgres ? "(c.chunk_z::bigint * 16)" : "(c.chunk_z * 16)";
+        sql.append(" AND ((").append(chunkX).append(" + (c.packed_position & 15) - ?)");
+        sql.append(" * (").append(chunkX).append(" + (c.packed_position & 15) - ?)");
+        sql.append(" + (").append(chunkZ).append(" + ((c.packed_position >> 4) & 15) - ?)");
+        sql.append(" * (").append(chunkZ).append(" + ((c.packed_position >> 4) & 15) - ?)) <= ?");
+    }
+
+    private int bindQueryPrefix(
+        PreparedStatement statement,
+        long worldId,
+        HistoryQuery query,
+        UUID actorUuid,
+        boolean filterActor,
+        boolean postgres
+    ) throws SQLException {
+        int parameter = 1;
+        statement.setLong(parameter++, worldId);
+        statement.setLong(parameter++, query.since());
+        if (query.exactPosition()) {
+            BlockPosition position = new BlockPosition(
+                query.worldId(), query.exactX(), query.exactY(), query.exactZ()
+            );
+            statement.setInt(parameter++, position.chunkX());
+            statement.setInt(parameter++, position.chunkZ());
+            statement.setLong(parameter++, PositionCodec.pack(position));
+        } else {
+            statement.setInt(parameter++, Math.subtractExact(query.centerX(), query.radius()) >> 4);
+            statement.setInt(parameter++, Math.addExact(query.centerX(), query.radius()) >> 4);
+            statement.setInt(parameter++, Math.subtractExact(query.centerZ(), query.radius()) >> 4);
+            statement.setInt(parameter++, Math.addExact(query.centerZ(), query.radius()) >> 4);
+            statement.setLong(parameter++, query.centerX());
+            statement.setLong(parameter++, query.centerX());
+            statement.setLong(parameter++, query.centerZ());
+            statement.setLong(parameter++, query.centerZ());
+            statement.setLong(parameter++, Math.multiplyExact((long) query.radius(), query.radius()));
+        }
+        if (actorUuid != null) {
+            if (postgres) {
+                statement.setObject(parameter++, actorUuid);
+            } else {
+                statement.setBytes(parameter++, UuidCodec.encode(actorUuid));
+            }
+        } else if (filterActor) {
+            statement.setString(parameter++, query.actor());
+        }
+        if (query.cause() != null) {
+            statement.setInt(parameter++, query.cause().storageCode());
+        }
+        return parameter;
+    }
+
+    @Override
     public Map<BlockPosition, ChangeRecord> latestChanges(List<BlockPosition> positions) {
         if (positions.isEmpty()) {
             return Map.of();
@@ -715,6 +836,178 @@ final class SqliteHistoryRepository implements HistoryRepository {
     }
 
     @Override
+    public void prepareOperation(OperationHeader operation, OperationItemSource items, int batchSize) {
+        if (batchSize <= 0) {
+            throw new IllegalArgumentException("Operation preparation batch size must be positive");
+        }
+        try {
+            inTransaction(() -> {
+                long actorId = actorId(operation.actor());
+                try (PreparedStatement operationStatement = connection.prepareStatement("""
+                        INSERT INTO operations(
+                            operation_uuid, created_at, actor_id, kind, status,
+                            summary, inverse_of, item_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """);
+                     PreparedStatement itemStatement = connection.prepareStatement(insertOperationItemSql())) {
+                    operationStatement.setBytes(1, UuidCodec.encode(operation.id()));
+                    operationStatement.setLong(2, operation.createdAt());
+                    operationStatement.setLong(3, actorId);
+                    operationStatement.setInt(4, operation.kind().storageCode());
+                    operationStatement.setInt(5, OperationStatus.PREPARED.storageCode());
+                    operationStatement.setString(6, operation.summary());
+                    setNullableUuid(operationStatement, 7, operation.inverseOf());
+                    operationStatement.setInt(8, operation.itemCount());
+                    operationStatement.executeUpdate();
+
+                    int inserted = 0;
+                    while (true) {
+                        List<OperationItem> batch = items.readBatch(batchSize);
+                        if (batch.isEmpty()) {
+                            break;
+                        }
+                        Map<Long, Integer> references = new LinkedHashMap<>();
+                        for (OperationItem item : batch) {
+                            addStateReferences(
+                                references,
+                                bindOperationItem(itemStatement, operation.id(), item, false)
+                            );
+                            itemStatement.addBatch();
+                        }
+                        itemStatement.executeBatch();
+                        adjustStateReferences(references, 1);
+                        inserted = Math.addExact(inserted, batch.size());
+                    }
+                    if (inserted != operation.itemCount()) {
+                        throw new StorageException(
+                            "Operation plan contained " + inserted + " items; expected " + operation.itemCount()
+                        );
+                    }
+                }
+            });
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to prepare streamed History operation", exception);
+        }
+    }
+
+    @Override
+    public void checkpointOperation(OperationCheckpoint checkpoint) {
+        try {
+            inTransaction(() -> checkpointOperationInTransaction(checkpoint));
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to checkpoint History operation", exception);
+        }
+    }
+
+    private void checkpointOperationInTransaction(OperationCheckpoint checkpoint) throws SQLException {
+        OperationSummary summary = loadOperationSummaryInternal(checkpoint.operationId())
+            .orElseThrow(() -> new StorageException("Prepared operation was not found"));
+        if (summary.status() != OperationStatus.PREPARED) {
+            if (checkpoint.applied().stream().allMatch(applied -> operationItemApplied(
+                checkpoint.operationId(),
+                applied.item().sequence()
+            ))) {
+                return;
+            }
+            throw new StorageException("Operation is no longer in PREPARED state");
+        }
+
+        List<AppliedOperationItem> newlyApplied = new ArrayList<>();
+        try (PreparedStatement itemStatement = connection.prepareStatement("""
+                UPDATE operation_items SET applied = 1
+                 WHERE operation_uuid = ? AND sequence = ? AND applied = 0
+                """)) {
+            for (AppliedOperationItem applied : checkpoint.applied()) {
+                itemStatement.setBytes(1, UuidCodec.encode(checkpoint.operationId()));
+                itemStatement.setInt(2, applied.item().sequence());
+                itemStatement.addBatch();
+            }
+            int[] results = itemStatement.executeBatch();
+            for (int index = 0; index < results.length; index++) {
+                if (results[index] > 0 || results[index] == Statement.SUCCESS_NO_INFO) {
+                    newlyApplied.add(checkpoint.applied().get(index));
+                } else if (results[index] == Statement.EXECUTE_FAILED) {
+                    throw new StorageException("Operation item checkpoint batch failed");
+                }
+            }
+        }
+        if (newlyApplied.isEmpty()) {
+            return;
+        }
+
+        List<ChangeRecord> auditChanges = new ArrayList<>(newlyApplied.size());
+        try (PreparedStatement changeStatement = connection.prepareStatement(insertChangeSql())) {
+            Map<Long, Integer> references = new LinkedHashMap<>();
+            ChangeCause cause = summary.header().kind() == OperationKind.ROLLBACK
+                ? ChangeCause.HISTORY_ROLLBACK
+                : ChangeCause.HISTORY_UNDO;
+            for (AppliedOperationItem applied : newlyApplied) {
+                ChangeRecord auditChange = new ChangeRecord(
+                    0L,
+                    checkpoint.checkpointAt(),
+                    applied.item().position(),
+                    summary.header().actor(),
+                    cause,
+                    applied.actualBefore(),
+                    applied.actualAfter(),
+                    checkpoint.operationId(),
+                    null,
+                    "history-operation"
+                );
+                auditChanges.add(auditChange);
+                addStateReferences(references, bindChange(changeStatement, auditChange, false));
+                changeStatement.addBatch();
+            }
+            changeStatement.executeBatch();
+            adjustStateReferences(references, 1);
+            updateStorageMetrics(metricDeltas(auditChanges));
+        }
+        try (PreparedStatement statement = connection.prepareStatement("""
+            UPDATE operations SET applied_count = applied_count + ?
+             WHERE operation_uuid = ? AND status = ?
+            """)) {
+            statement.setInt(1, newlyApplied.size());
+            statement.setBytes(2, UuidCodec.encode(checkpoint.operationId()));
+            statement.setInt(3, OperationStatus.PREPARED.storageCode());
+            if (statement.executeUpdate() != 1) {
+                throw new StorageException("Prepared operation state changed during checkpoint");
+            }
+        }
+    }
+
+    @Override
+    public void finalizeOperation(OperationFinalization finalization) {
+        try {
+            inTransaction(() -> {
+                try (PreparedStatement statement = connection.prepareStatement("""
+                    UPDATE operations
+                       SET completed_at = ?, status = ?, skipped_count = ?, failure = ?
+                     WHERE operation_uuid = ? AND status = ?
+                    """)) {
+                    statement.setLong(1, finalization.completedAt());
+                    statement.setInt(2, finalization.status().storageCode());
+                    statement.setInt(3, finalization.skipped());
+                    setNullableText(statement, 4, finalization.failure());
+                    statement.setBytes(5, UuidCodec.encode(finalization.operationId()));
+                    statement.setInt(6, OperationStatus.PREPARED.storageCode());
+                    if (statement.executeUpdate() == 1) {
+                        return;
+                    }
+                }
+                OperationSummary existing = loadOperationSummaryInternal(finalization.operationId())
+                    .orElseThrow(() -> new StorageException("Operation was not found during finalization"));
+                if (existing.status() != finalization.status()
+                    || existing.skippedCount() != finalization.skipped()
+                    || !existing.failure().equals(finalization.failure())) {
+                    throw new StorageException("Operation finalization conflicts with its durable state");
+                }
+            });
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to finalize History operation", exception);
+        }
+    }
+
+    @Override
     public void completeOperation(OperationCompletion completion) {
         try {
             inTransaction(() -> {
@@ -818,6 +1111,152 @@ final class SqliteHistoryRepository implements HistoryRepository {
     }
 
     @Override
+    public Optional<OperationSummary> loadOperationSummary(UUID operationId) {
+        try {
+            return loadOperationSummaryInternal(operationId);
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to load History operation summary", exception);
+        }
+    }
+
+    @Override
+    public Optional<OperationSummary> findLastOperationSummary(UUID actorId) {
+        String sql = """
+            SELECT o.operation_uuid
+              FROM operations o
+              JOIN actors a ON a.id = o.actor_id
+             WHERE a.uuid = ? AND o.status IN (?, ?)
+             ORDER BY o.created_at DESC
+             LIMIT 1
+            """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setBytes(1, UuidCodec.encode(actorId));
+            statement.setInt(2, OperationStatus.APPLIED.storageCode());
+            statement.setInt(3, OperationStatus.PARTIAL.storageCode());
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next()
+                    ? loadOperationSummaryInternal(UuidCodec.decode(result.getBytes(1)))
+                    : Optional.empty();
+            }
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to find the last History operation summary", exception);
+        }
+    }
+
+    @Override
+    public void scanAppliedOperationItems(UUID operationId, OperationItemSink sink) {
+        scanOperationItems(operationId, true, sink);
+    }
+
+    @Override
+    public void scanPendingOperationItems(UUID operationId, OperationItemSink sink) {
+        scanOperationItems(operationId, false, sink);
+    }
+
+    private void scanOperationItems(UUID operationId, boolean applied, OperationItemSink sink) {
+        Objects.requireNonNull(operationId, "operationId");
+        Objects.requireNonNull(sink, "sink");
+        String sql = """
+            SELECT i.sequence, w.uuid AS world_uuid, i.chunk_x, i.chunk_z, i.packed_position,
+                   bs1.block_data AS before_data,
+                   bs1.payload_type AS before_payload_type,
+                   bs1.payload AS before_payload,
+                   bs2.block_data AS after_data,
+                   bs2.payload_type AS after_payload_type,
+                   bs2.payload AS after_payload,
+                   i.source_ids
+              FROM operation_items i
+              JOIN worlds w ON w.id = i.world_id
+              JOIN block_states bs1 ON bs1.id = i.before_state_id
+              JOIN block_states bs2 ON bs2.id = i.after_state_id
+             WHERE i.operation_uuid = ? AND i.applied = ?
+             ORDER BY i.chunk_x, i.chunk_z, i.packed_position, i.sequence
+            """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setBytes(1, UuidCodec.encode(operationId));
+            statement.setInt(2, applied ? 1 : 0);
+            statement.setFetchSize(2_048);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    sink.accept(readOperationItem(result));
+                }
+            }
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to stream History operation items", exception);
+        }
+    }
+
+    private Optional<OperationSummary> loadOperationSummaryInternal(UUID operationId) throws SQLException {
+        String sql = """
+            SELECT o.created_at, a.uuid AS actor_uuid, a.name AS actor_name,
+                   a.kind AS actor_kind, o.kind, o.status, o.summary, o.inverse_of,
+                   o.item_count, o.applied_count, o.skipped_count, o.failure
+              FROM operations o
+              JOIN actors a ON a.id = o.actor_id
+             WHERE o.operation_uuid = ?
+            """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setBytes(1, UuidCodec.encode(operationId));
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) {
+                    return Optional.empty();
+                }
+                ActorRef actor = new ActorRef(
+                    UuidCodec.decode(result.getBytes("actor_uuid")),
+                    result.getString("actor_name"),
+                    ActorKind.fromStorageCode(result.getInt("actor_kind"))
+                );
+                OperationHeader header = new OperationHeader(
+                    operationId,
+                    result.getLong("created_at"),
+                    actor,
+                    OperationKind.fromStorageCode(result.getInt("kind")),
+                    result.getString("summary"),
+                    UuidCodec.decode(result.getBytes("inverse_of")),
+                    result.getInt("item_count")
+                );
+                return Optional.of(new OperationSummary(
+                    header,
+                    OperationStatus.fromStorageCode(result.getInt("status")),
+                    result.getInt("applied_count"),
+                    result.getInt("skipped_count"),
+                    emptyIfNull(result.getString("failure"))
+                ));
+            }
+        }
+    }
+
+    private OperationItem readOperationItem(ResultSet result) throws SQLException {
+        UUID worldId = UuidCodec.decode(result.getBytes("world_uuid"));
+        return new OperationItem(
+            result.getInt("sequence"),
+            PositionCodec.unpack(
+                worldId,
+                result.getInt("chunk_x"),
+                result.getInt("chunk_z"),
+                result.getLong("packed_position")
+            ),
+            readSnapshot(result, "before"),
+            readSnapshot(result, "after"),
+            SourceIdCodec.decode(result.getBytes("source_ids"))
+        );
+    }
+
+    private boolean operationItemApplied(UUID operationId, int sequence) {
+        try (PreparedStatement statement = connection.prepareStatement("""
+            SELECT applied FROM operation_items WHERE operation_uuid = ? AND sequence = ?
+            """)) {
+            statement.setBytes(1, UuidCodec.encode(operationId));
+            statement.setInt(2, sequence);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() && result.getInt(1) != 0;
+            }
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to verify a History operation checkpoint", exception);
+        }
+    }
+
+    @Override
     public int interruptedOperationCount() {
         try (PreparedStatement statement = connection.prepareStatement(
             "SELECT COUNT(*) FROM operations WHERE status = ?"
@@ -828,6 +1267,31 @@ final class SqliteHistoryRepository implements HistoryRepository {
             }
         } catch (SQLException exception) {
             throw new StorageException("Unable to count interrupted History operations", exception);
+        }
+    }
+
+    @Override
+    public List<UUID> interruptedOperationIds(int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+        try (PreparedStatement statement = connection.prepareStatement("""
+            SELECT operation_uuid FROM operations
+             WHERE status = ?
+             ORDER BY created_at DESC, operation_uuid
+             LIMIT ?
+            """)) {
+            statement.setInt(1, OperationStatus.PREPARED.storageCode());
+            statement.setInt(2, limit);
+            List<UUID> ids = new ArrayList<>();
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    ids.add(UuidCodec.decode(result.getBytes(1)));
+                }
+            }
+            return List.copyOf(ids);
+        } catch (SQLException exception) {
+            throw new StorageException("Unable to list interrupted History operations", exception);
         }
     }
 

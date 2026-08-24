@@ -8,7 +8,10 @@ import kr.playcity.history.model.ChangeCause;
 import kr.playcity.history.model.ChangeRecord;
 import kr.playcity.history.model.HistoryQuery;
 import kr.playcity.history.model.OperationCompletion;
+import kr.playcity.history.model.OperationCheckpoint;
 import kr.playcity.history.model.OperationDraft;
+import kr.playcity.history.model.OperationFinalization;
+import kr.playcity.history.model.OperationHeader;
 import kr.playcity.history.model.OperationItem;
 import kr.playcity.history.model.OperationKind;
 import kr.playcity.history.model.OperationStatus;
@@ -389,6 +392,132 @@ class SqliteHistoryRepositoryTest {
         assertEquals(1, audit.size());
         assertEquals(ChangeCause.HISTORY_ROLLBACK, audit.getFirst().cause());
         assertEquals(operationId, audit.getFirst().operationId());
+    }
+
+    @Test
+    void streamsRollbackQueriesWithoutTreatingFetchSizeAsAResultLimit() {
+        int changeCount = 12_000;
+        List<ChangeRecord> changes = new ArrayList<>(changeCount);
+        for (int index = 0; index < changeCount; index++) {
+            changes.add(change(
+                1_000L + index,
+                index,
+                64,
+                0,
+                "minecraft:stone",
+                "minecraft:dirt"
+            ));
+        }
+        repository.insertBatch(changes);
+        List<Integer> streamedX = new ArrayList<>();
+
+        repository.scanRollbackChanges(
+            HistoryQuery.nearby(WORLD_ID, changeCount / 2, 0, changeCount, 0L, null, 127)
+                .forRollback(),
+            change -> streamedX.add(change.position().x())
+        );
+
+        assertEquals(changeCount, streamedX.size());
+        assertEquals(0, streamedX.getFirst());
+        assertEquals(changeCount - 1, streamedX.getLast());
+    }
+
+    @Test
+    void streamsOperationPreparationAndCheckpointsEachChunkIdempotently() {
+        int itemCount = 5_000;
+        UUID operationId = UUID.randomUUID();
+        OperationHeader header = new OperationHeader(
+            operationId,
+            1_000L,
+            ACTOR,
+            OperationKind.ROLLBACK,
+            "large streamed rollback",
+            null,
+            itemCount
+        );
+        repository.prepareOperation(header, new GeneratedOperationSource(itemCount), 73);
+        assertEquals(OperationStatus.PREPARED, repository.loadOperationSummary(operationId).orElseThrow().status());
+        assertEquals(List.of(operationId), repository.interruptedOperationIds(10));
+        assertEquals(itemCount, repository.loadOperationSummary(operationId).orElseThrow().header().itemCount());
+
+        List<AppliedOperationItem> firstChunk = new ArrayList<>();
+        for (int sequence = 0; sequence < 16; sequence++) {
+            OperationItem item = generatedItem(sequence);
+            firstChunk.add(new AppliedOperationItem(item, item.before(), item.after()));
+        }
+        OperationCheckpoint checkpoint = new OperationCheckpoint(operationId, 2_000L, firstChunk);
+        repository.checkpointOperation(checkpoint);
+        repository.checkpointOperation(checkpoint);
+
+        assertEquals(16, repository.loadOperationSummary(operationId).orElseThrow().appliedCount());
+        List<OperationItem> applied = new ArrayList<>();
+        repository.scanAppliedOperationItems(operationId, applied::add);
+        assertEquals(16, applied.size());
+        assertEquals(0, applied.getFirst().sequence());
+        assertEquals(15, applied.getLast().sequence());
+        List<OperationItem> pending = new ArrayList<>();
+        repository.scanPendingOperationItems(operationId, pending::add);
+        assertEquals(itemCount - firstChunk.size(), pending.size());
+        assertEquals(16, pending.getFirst().sequence());
+        assertEquals(itemCount - 1, pending.getLast().sequence());
+
+        // A recovery retry checkpoints the same chunk without double counting.
+        repository.checkpointOperation(checkpoint);
+        assertEquals(16, repository.loadOperationSummary(operationId).orElseThrow().appliedCount());
+
+        repository.finalizeOperation(new OperationFinalization(
+            operationId,
+            3_000L,
+            OperationStatus.PARTIAL,
+            itemCount - firstChunk.size(),
+            "test-stop"
+        ));
+        repository.finalizeOperation(new OperationFinalization(
+            operationId,
+            3_000L,
+            OperationStatus.PARTIAL,
+            itemCount - firstChunk.size(),
+            "test-stop"
+        ));
+        assertEquals(OperationStatus.PARTIAL, repository.loadOperationSummary(operationId).orElseThrow().status());
+        assertEquals(0, repository.interruptedOperationCount());
+        assertTrue(repository.interruptedOperationIds(10).isEmpty());
+        assertEquals(
+            16,
+            repository.query(HistoryQuery.nearby(WORLD_ID, 8, 0, 32, 0L, null, 100)).size()
+        );
+    }
+
+    private static OperationItem generatedItem(int sequence) {
+        return new OperationItem(
+            sequence,
+            new BlockPosition(WORLD_ID, sequence, 64, 0),
+            BlockSnapshot.block("minecraft:dirt"),
+            BlockSnapshot.block("minecraft:stone"),
+            List.of(10_000L + sequence)
+        );
+    }
+
+    private static final class GeneratedOperationSource implements OperationItemSource {
+        private final int itemCount;
+        private int cursor;
+
+        private GeneratedOperationSource(int itemCount) {
+            this.itemCount = itemCount;
+        }
+
+        @Override
+        public List<OperationItem> readBatch(int maximumItems) {
+            List<OperationItem> batch = new ArrayList<>(Math.min(maximumItems, itemCount - cursor));
+            while (cursor < itemCount && batch.size() < maximumItems) {
+                batch.add(generatedItem(cursor++));
+            }
+            return List.copyOf(batch);
+        }
+
+        @Override
+        public void close() {
+        }
     }
 
     private static ChangeRecord change(

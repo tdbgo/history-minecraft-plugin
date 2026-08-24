@@ -5,6 +5,7 @@ import kr.playcity.history.model.ChangeRecord;
 import kr.playcity.history.rollback.OperationRunResult;
 import kr.playcity.history.rollback.RollbackPreview;
 import kr.playcity.history.storage.StoreStatus;
+import kr.playcity.history.storage.CaptureRecoveryResult;
 import kr.playcity.history.storage.StorageProfile;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.TextComponent;
@@ -16,6 +17,8 @@ import net.kyori.adventure.text.format.TextDecoration;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
+import java.util.List;
+import java.util.UUID;
 
 public final class HistoryUi {
     private static final Component PREFIX = Component.text("History", NamedTextColor.AQUA, TextDecoration.BOLD)
@@ -81,16 +84,12 @@ public final class HistoryUi {
     }
 
     public static Component preview(RollbackPreview preview) {
-        long targetChunks = preview.items().stream()
-            .map(item -> item.position().worldId() + ":" + item.position().chunkX() + ":" + item.position().chunkZ())
-            .distinct()
-            .count();
         Component summary = prefixed(Component.text(
-            preview.sourceChanges() + "개 기록에서 안전하게 적용 가능한 블록 " + preview.items().size() + "개",
+            preview.sourceChanges() + "개 기록에서 안전하게 적용 가능한 블록 " + preview.itemCount() + "개",
             NamedTextColor.WHITE
         ));
         Component skipped = Component.text(
-            "충돌 " + preview.conflicts() + " · 대상 청크 " + targetChunks + " (미로드 자동 로드)"
+            "충돌 " + preview.conflicts() + " · 대상 청크 " + preview.chunkCount() + " (미로드 자동 로드)"
                 + " · 이미 목표 상태 " + preview.alreadyTarget(),
             NamedTextColor.GRAY
         );
@@ -100,11 +99,7 @@ public final class HistoryUi {
             .append(Component.text(preview.summary(), NamedTextColor.DARK_GRAY))
             .append(Component.newline())
             .append(skipped);
-        if (preview.sourceLimitReached()) {
-            builder.append(Component.newline())
-                .append(Component.text("검색 상한에 도달했습니다. 범위나 기간을 줄여 주세요.", NamedTextColor.RED));
-        }
-        if (!preview.items().isEmpty()) {
+        if (preview.itemCount() > 0) {
             builder.append(Component.newline())
                 .append(button("확인하고 적용", "/history confirm " + preview.token(), NamedTextColor.RED))
                 .append(Component.space())
@@ -135,17 +130,39 @@ public final class HistoryUi {
     }
 
     public static Component status(StoreStatus status) {
-        NamedTextColor healthColor = status.healthy() ? NamedTextColor.GREEN : NamedTextColor.RED;
+        NamedTextColor healthColor;
+        String heading;
+        if (!status.healthy()) {
+            healthColor = NamedTextColor.RED;
+            heading = "저장소 오류";
+        } else if (!status.ready()) {
+            healthColor = NamedTextColor.YELLOW;
+            heading = "준비 중";
+        } else if (!status.accepting()) {
+            healthColor = NamedTextColor.RED;
+            heading = "기록 중단";
+        } else if (status.degraded()) {
+            healthColor = NamedTextColor.YELLOW;
+            heading = "경고 · 캡처 공백 발생";
+        } else if (!status.captureComplete()) {
+            healthColor = NamedTextColor.YELLOW;
+            heading = "정상 수락 · 과거 공백 있음";
+        } else {
+            healthColor = NamedTextColor.GREEN;
+            heading = "정상";
+        }
         TextComponent.Builder builder = Component.text()
             .append(prefixed(Component.text(
-                status.healthy() ? "정상 · " + status.backend() : "확인 필요 · " + status.backend(),
+                heading + " · " + status.backend(),
                 healthColor
             )))
             .append(Component.newline())
             .append(Component.text(
                 "준비 " + yesNo(status.ready())
                     + " · 기록 수락 " + yesNo(status.accepting())
-                    + " · 대기 " + status.queued(),
+                    + " · DB 대기 " + status.databaseQueued()
+                    + " · 미확정 외부 편집 " + status.pendingReservations()
+                    + " / " + status.pendingReservationChanges() + "변경",
                 NamedTextColor.GRAY
             ))
             .append(Component.newline())
@@ -153,10 +170,29 @@ public final class HistoryUi {
                 "수락 " + status.accepted()
                     + " · 저장 " + status.persisted()
                     + " · 복구 등가 병합 " + status.compacted()
-                    + " · 거부 " + status.rejected()
+                    + " · 직접 거부 " + status.rejected()
+                    + " · 캡처 공백 " + status.captureGapEvents()
+                    + "회 / " + status.captureGapChanges() + "변경"
+                    + " · WorldEdit/FAWE 공백 " + status.worldEditCaptureGapEvents()
+                    + "회 / " + status.worldEditCaptureGapChanges() + "변경"
                     + " · 만료 정리 " + status.purged(),
                 NamedTextColor.GRAY
             ));
+        if (status.unknownCaptureGapEvents() > 0) {
+            builder.append(Component.newline())
+                .append(Component.text(
+                    "변경 수를 산정할 수 없는 캡처 공백 " + status.unknownCaptureGapEvents() + "회",
+                    NamedTextColor.YELLOW
+                ));
+        }
+        if (status.pendingReservations() > 0) {
+            builder.append(Component.newline())
+                .append(Component.text(
+                    "가장 오래된 미확정 편집 " + status.oldestReservationAgeMillis()
+                        + "ms · " + status.oldestReservationId(),
+                    NamedTextColor.YELLOW
+                ));
+        }
         if (status.interruptedOperations() > 0) {
             builder.append(Component.newline())
                 .append(Component.text(
@@ -166,9 +202,36 @@ public final class HistoryUi {
         }
         if (!status.lastError().isBlank()) {
             builder.append(Component.newline())
-                .append(Component.text(status.lastError(), NamedTextColor.RED));
+                .append(Component.text(
+                    status.lastError(),
+                    status.healthy() && status.accepting()
+                        ? NamedTextColor.YELLOW
+                        : NamedTextColor.RED
+                ));
         }
         return builder.build();
+    }
+
+    public static Component interruptedOperations(List<UUID> operationIds) {
+        TextComponent.Builder builder = Component.text()
+            .append(prefixed(Component.text("복구 가능한 중단 작업", NamedTextColor.YELLOW)));
+        for (UUID operationId : operationIds) {
+            builder.append(Component.newline())
+                .append(button(
+                    operationId.toString().substring(0, 8),
+                    "/history recover " + operationId,
+                    NamedTextColor.GOLD
+                ))
+                .append(Component.text("  " + operationId, NamedTextColor.DARK_GRAY));
+        }
+        return builder.build();
+    }
+
+    public static Component captureRecovery(CaptureRecoveryResult result) {
+        return prefixed(Component.text(
+            result.message(),
+            result.resumed() ? NamedTextColor.YELLOW : NamedTextColor.RED
+        ));
     }
 
     public static Component storageProfile(StorageProfile profile) {

@@ -14,6 +14,7 @@ import org.bukkit.block.BlockState;
 
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
+import java.util.List;
 import java.util.UUID;
 
 public final class ChangeRecorder {
@@ -76,7 +77,8 @@ public final class ChangeRecorder {
         }
     }
 
-    public void recordBatchChange(
+    /** Records a fallback WorldEdit mutation after the delegate has applied it. */
+    public boolean recordAppliedBatchChange(
         BlockPosition position,
         ActorRef actor,
         ChangeCause cause,
@@ -86,47 +88,70 @@ public final class ChangeRecorder {
         String metadata
     ) {
         if (before.sameState(after, true)) {
-            return;
-        }
-        boolean accepted = positionGuard.recordMutation(position, () -> store.append(ChangeRecord.capturedInBatch(
-            position,
-            actor,
-            cause,
-            before,
-            after,
-            batchId,
-            metadata
-        )));
-        if (!accepted) {
-            warnRejectedWrite();
-        }
-    }
-
-    public boolean recordFaweBatchChange(
-        BlockPosition position,
-        ActorRef actor,
-        BlockSnapshot before,
-        BlockSnapshot after,
-        UUID batchId
-    ) {
-        if (before.sameState(after, true)) {
             return true;
         }
-        boolean accepted = positionGuard.recordMutation(position, () -> store.appendWorldEdit(
-            ChangeRecord.capturedInBatch(
-                position,
-                actor,
-                ChangeCause.WORLD_EDIT,
-                before,
-                after,
-                batchId,
-                ""
-            )
-        ));
-        if (!accepted) {
-            warnRejectedWrite();
+        ChangeRecord change = ChangeRecord.capturedInBatch(
+            position, actor, cause, before, after, batchId, metadata
+        );
+        boolean recorded;
+        try {
+            recorded = store.tryAppendWorldEdit(change);
+            positionGuard.markMutation(position);
+        } catch (RuntimeException | LinkageError failure) {
+            safeReportCaptureGap(1L, "worldedit", "WorldEdit 적용 후 기록 중 내부 오류가 발생했습니다.");
+            recorded = false;
         }
-        return accepted;
+        if (!recorded) {
+            warnWorldEditCaptureGap();
+        }
+        return recorded;
+    }
+
+    /** Records one already-applied FAWE chunk as an all-or-none queue admission. */
+    public boolean recordAppliedFaweBatch(List<ChangeRecord> changes) {
+        if (changes.isEmpty()) {
+            return true;
+        }
+        boolean recorded;
+        try {
+            recorded = store.tryAppendWorldEditBatch(changes);
+            for (ChangeRecord change : changes) {
+                positionGuard.markMutation(change.position());
+            }
+        } catch (RuntimeException | LinkageError failure) {
+            safeReportCaptureGap(changes.size(), "fawe", "FAWE 청크 적용 후 기록 중 내부 오류가 발생했습니다.");
+            recorded = false;
+        }
+        if (!recorded) {
+            warnWorldEditCaptureGap();
+        }
+        return recorded;
+    }
+
+    public void beginFaweCapture(UUID observationId, long estimatedChanges) {
+        store.beginExternalCapture(observationId, estimatedChanges, "fawe");
+    }
+
+    public void completeFaweCapture(UUID observationId) {
+        store.completeExternalCapture(observationId);
+    }
+
+    public void abandonFaweCapture(UUID observationId, String reason) {
+        store.abandonExternalCapture(observationId, reason);
+        warnWorldEditCaptureGap();
+    }
+
+    public void reportFaweCaptureGap(long estimatedChanges, String reason) {
+        safeReportCaptureGap(estimatedChanges, "fawe", reason);
+        warnWorldEditCaptureGap();
+    }
+
+    private void safeReportCaptureGap(long estimatedChanges, String source, String reason) {
+        try {
+            store.reportCaptureGap(estimatedChanges, source, reason);
+        } catch (RuntimeException | LinkageError ignored) {
+            // Capture diagnostics must never escape into an applied edit path.
+        }
     }
 
     public void recordAudit(Location location, ActorRef actor, ChangeCause cause, String metadata) {
@@ -185,6 +210,17 @@ public final class ChangeRecorder {
         long previous = lastWarning.get();
         if (now - previous >= WARNING_INTERVAL_NANOS && lastWarning.compareAndSet(previous, now)) {
             logger.severe("History rejected a world change; check /history status immediately.");
+        }
+    }
+
+    private void warnWorldEditCaptureGap() {
+        long now = System.nanoTime();
+        long previous = lastWarning.get();
+        if (now - previous >= WARNING_INTERVAL_NANOS && lastWarning.compareAndSet(previous, now)) {
+            logger.warning(
+                "History가 WorldEdit/FAWE 편집은 중단하지 않았지만 일부 기록을 남기지 못했습니다. "
+                    + "/history status에서 캡처 공백을 확인하십시오."
+            );
         }
     }
 
