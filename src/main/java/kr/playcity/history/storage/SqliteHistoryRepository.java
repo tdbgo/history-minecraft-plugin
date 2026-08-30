@@ -1813,7 +1813,8 @@ final class SqliteHistoryRepository implements HistoryRepository {
     }
 
     private long stateId(BlockSnapshot snapshot) throws SQLException {
-        Long cached = stateIds.get(snapshot);
+        boolean cacheable = StateCachePolicy.shouldCache(snapshot);
+        Long cached = cacheable ? stateIds.get(snapshot) : null;
         if (cached != null) {
             return cached;
         }
@@ -1834,7 +1835,9 @@ final class SqliteHistoryRepository implements HistoryRepository {
                         throw new StorageException("A block-state fingerprint collision was detected");
                     }
                     long id = result.getLong("id");
-                    stateIds.put(snapshot, id);
+                    if (cacheable) {
+                        stateIds.put(snapshot, id);
+                    }
                     return id;
                 }
             }
@@ -1855,7 +1858,9 @@ final class SqliteHistoryRepository implements HistoryRepository {
             }
             insert.executeUpdate();
             long id = generatedId(insert, "block state");
-            stateIds.put(snapshot, id);
+            if (cacheable) {
+                stateIds.put(snapshot, id);
+            }
             return id;
         }
     }

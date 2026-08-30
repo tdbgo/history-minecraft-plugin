@@ -124,6 +124,27 @@ class PostgresHistoryRepositoryTest {
     }
 
     @Test
+    void isolatesIdenticalCoordinatesAcrossMultipleWorlds() {
+        UUID secondWorld = UUID.fromString("50000000-0000-0000-0000-000000000099");
+        repository.insertBatch(List.of(
+            change(WORLD_ID, 100L, 4, "minecraft:stone", "minecraft:gold_block"),
+            change(secondWorld, 200L, 4, "minecraft:stone", "minecraft:diamond_block")
+        ));
+
+        List<ChangeRecord> first = repository.query(
+            HistoryQuery.at(WORLD_ID, 4, 64, 0, 0L, 10)
+        );
+        List<ChangeRecord> second = repository.query(
+            HistoryQuery.at(secondWorld, 4, 64, 0, 0L, 10)
+        );
+
+        assertEquals(1, first.size());
+        assertEquals("minecraft:gold_block", first.getFirst().after().blockData());
+        assertEquals(1, second.size());
+        assertEquals("minecraft:diamond_block", second.getFirst().after().blockData());
+    }
+
+    @Test
     void migratesVersionOneReferenceCounts() throws Exception {
         repository.insertBatch(List.of(change(100L, 3, "minecraft:stone", "minecraft:dirt")));
         repository.close();
@@ -198,10 +219,14 @@ class PostgresHistoryRepositoryTest {
     }
 
     private static ChangeRecord change(long time, int x, String before, String after) {
+        return change(WORLD_ID, time, x, before, after);
+    }
+
+    private static ChangeRecord change(UUID worldId, long time, int x, String before, String after) {
         return new ChangeRecord(
             0L,
             time,
-            new BlockPosition(WORLD_ID, x, 64, 0),
+            new BlockPosition(worldId, x, 64, 0),
             ACTOR,
             ChangeCause.PLAYER_PLACE,
             BlockSnapshot.block(before),

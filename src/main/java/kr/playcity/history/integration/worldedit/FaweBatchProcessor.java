@@ -14,6 +14,7 @@ import kr.playcity.history.model.BlockPosition;
 import kr.playcity.history.model.BlockSnapshot;
 import kr.playcity.history.model.ChangeCause;
 import kr.playcity.history.model.ChangeRecord;
+import org.bukkit.Bukkit;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -65,12 +66,12 @@ final class FaweBatchProcessor implements IBatchProcessor {
     @Override
     public Future<?> postProcessSet(IChunk chunk, IChunkGet get, IChunkSet set) {
         long chunkKey = chunkKey(chunk);
-        if (!admission.beginPost(chunkKey)) {
+        if (!admission.beginPost(chunkKey, set)) {
             return CompletableFuture.completedFuture(null);
         }
         try {
             List<ChangeRecord> changes = capture(chunk, get, set);
-            recorder.recordAppliedFaweBatch(changes);
+            recorder.recordAppliedFaweBatch(changes, !Bukkit.isPrimaryThread());
         } catch (RuntimeException | LinkageError failure) {
             recorder.reportFaweCaptureGap(
                 0L,

@@ -2,6 +2,8 @@
 
 SQLite is the default backend. PostgreSQL is optional. PostgreSQL moves storage out of the Minecraft process, but it does not automatically use less disk space.
 
+Capture writes and history reads use separate database connections. Long lookups and rollback scans therefore do not stop the writer from draining its bounded queues. Each read first persists captures accepted before that read began, but it does not wait for newer continuous traffic to stop. SQLite uses WAL for concurrent readers; PostgreSQL uses an independent read connection.
+
 ## Data reduction
 
 History reduces repeated data before it is stored:
@@ -19,7 +21,7 @@ History reduces repeated data before it is stored:
 
 Direct changes and FAWE changes use separate bounded queues, so a large edit cannot consume the headroom reserved for players and server events. `storage.queue-capacity` bounds direct capture. `storage.worldedit-queue-capacity` independently bounds WorldEdit and FAWE capture.
 
-History observes FAWE only in post-processing. It never holds queue permits across FAWE callbacks and never throws a History capacity error into `set`, `cut`, `paste`, `stack`, `move`, `regen`, `undo`, or `redo`. One applied chunk is admitted to the bounded queue as an all-or-none batch. If storage cannot admit it immediately, the edit remains intact and History records a visible capture gap.
+History observes FAWE only in post-processing. It never holds queue permits across unmatched FAWE callbacks and never throws a History capacity error into `set`, `cut`, `paste`, `stack`, `move`, `regen`, `undo`, or `redo`. One applied chunk is admitted to the bounded queue as an all-or-none batch when it fits. A FAWE worker waits for queue headroom up to `worldedit-admission-timeout-ms`; batches larger than the internal queue are streamed through bounded sub-batches. Server-thread fallback capture never waits. If storage still cannot admit a batch, the edit remains intact and History records a visible capture gap.
 
 The WorldEdit fallback delegates the mutation first and then performs a non-blocking capture attempt. A History failure is not propagated through the edit path.
 

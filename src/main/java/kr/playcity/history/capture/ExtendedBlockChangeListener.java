@@ -70,7 +70,8 @@ public final class ExtendedBlockChangeListener implements Listener {
             List.of(event.getClickedBlock()),
             actors.player(event.getPlayer()),
             ChangeCause.PLAYER_INTERACT,
-            event.getAction().name().toLowerCase(java.util.Locale.ROOT)
+            event.getAction().name().toLowerCase(java.util.Locale.ROOT),
+            false
         );
     }
 
@@ -95,7 +96,8 @@ public final class ExtendedBlockChangeListener implements Listener {
                 List.of(event.getBlock()),
                 actors.player(event.getPlayer()),
                 ChangeCause.SIGN,
-                event.getSide().name().toLowerCase(java.util.Locale.ROOT)
+                event.getSide().name().toLowerCase(java.util.Locale.ROOT),
+                true
             );
         }
     }
@@ -197,7 +199,7 @@ public final class ExtendedBlockChangeListener implements Listener {
     }
 
     private void recordBucket(Block block, Player player, String metadata) {
-        recordActualNextTick(List.of(block), actors.player(player), ChangeCause.BUCKET, metadata);
+        recordActualNextTick(List.of(block), actors.player(player), ChangeCause.BUCKET, metadata, true);
     }
 
     private void recordState(Block block, BlockState after, ActorRef actor, String metadata) {
@@ -233,17 +235,29 @@ public final class ExtendedBlockChangeListener implements Listener {
         List<Block> blocks,
         ActorRef actor,
         ChangeCause cause,
-        String metadata
+        String metadata,
+        boolean capturePayload
     ) {
         Map<BlockPosition, Block> unique = new LinkedHashMap<>();
         Map<BlockPosition, BlockSnapshot> before = new LinkedHashMap<>();
         for (Block block : blocks) {
             BlockPosition position = position(block);
             unique.putIfAbsent(position, block);
-            before.computeIfAbsent(position, ignored -> snapshots.capture(block));
+            before.computeIfAbsent(position, ignored -> capturePayload
+                ? snapshots.capture(block)
+                : snapshots.captureBlockData(block));
         }
         plugin.getServer().getScheduler().runTask(plugin, () -> before.forEach((position, snapshot) ->
-            recorder.record(position, actor, cause, snapshot, snapshots.capture(unique.get(position)), metadata)
+            recorder.record(
+                position,
+                actor,
+                cause,
+                snapshot,
+                capturePayload
+                    ? snapshots.capture(unique.get(position))
+                    : snapshots.captureBlockData(unique.get(position)),
+                metadata
+            )
         ));
     }
 

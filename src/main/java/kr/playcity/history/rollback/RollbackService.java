@@ -31,6 +31,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -40,10 +41,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /** Streaming, exact-chunk rollback engine. */
 public final class RollbackService {
     private static final int WORLDWIDE_RADIUS = 42_500_000;
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 30L;
 
     private final JavaPlugin plugin;
     private final HistoryConfig.Rollback config;
@@ -57,6 +60,11 @@ public final class RollbackService {
     private final ExecutorService planExecutor;
     private final Path planDirectory;
     private final Set<Execution> activeExecutions = ConcurrentHashMap.newKeySet();
+    private final Set<CompletableFuture<OperationRunResult>> operationResults = ConcurrentHashMap.newKeySet();
+    private final Object executionLifecycle = new Object();
+    private final Set<PendingStart> pendingStarts = new HashSet<>();
+    private volatile boolean shutdownRequested;
+    private CompletableFuture<Void> shutdownFuture;
 
     public RollbackService(
         JavaPlugin plugin,
@@ -134,6 +142,7 @@ public final class RollbackService {
     ) {
         requireServerThread();
         requireRollbackAvailable();
+        UUID ownerId = player.getUniqueId();
         long since = Instant.now().minus(duration).toEpochMilli();
         HistoryQuery query = HistoryQuery.nearby(
             world.getUID(),
@@ -160,7 +169,7 @@ public final class RollbackService {
         return store.scanRollbackChanges(query, planner)
             .thenApply(unused -> planner.finish())
             .thenApply(result -> registerPreview(
-                player.getUniqueId(), OperationKind.ROLLBACK, summary, null, result
+                ownerId, OperationKind.ROLLBACK, summary, null, result
             ))
             .whenComplete((preview, failure) -> {
                 if (failure != null) {
@@ -171,9 +180,11 @@ public final class RollbackService {
     }
 
     public CompletableFuture<RollbackPreview> createUndoPreview(Player player, UUID operationId) {
+        requireServerThread();
         requireRollbackAvailable();
+        UUID ownerId = player.getUniqueId();
         CompletableFuture<Optional<OperationSummary>> operationFuture = operationId == null
-            ? store.findLastOperationSummary(player.getUniqueId())
+            ? store.findLastOperationSummary(ownerId)
             : store.loadOperationSummary(operationId);
         return operationFuture.thenCompose(optional -> {
             OperationSummary stored = optional.orElseThrow(
@@ -191,7 +202,7 @@ public final class RollbackService {
                         throw new IllegalStateException("Undo plan did not contain every applied operation item");
                     }
                     return registerPreview(
-                        player.getUniqueId(),
+                        ownerId,
                         OperationKind.UNDO,
                         "작업 " + shortId(stored.header().id()) + " 취소",
                         stored.header().id(),
@@ -262,22 +273,16 @@ public final class RollbackService {
         );
         OperationPlanSpool.Reader preparationSource = OperationPlanSpool.open(prepared.planFile());
         CompletableFuture<OperationRunResult> result = new CompletableFuture<>();
+        trackOperation(result);
         store.prepareOperation(header, preparationSource, config.operationWriteBatchSize())
             .whenComplete((unused, failure) -> {
                 if (failure != null) {
-                    OperationPlanSpool.delete(prepared.planFile());
-                    result.completeExceptionally(failure);
+                    result.completeExceptionally(deletePlan(prepared.planFile(), failure));
                     return;
                 }
-                if (!plugin.isEnabled()) {
-                    finalizeWithoutExecution(header, prepared.planFile(), result);
-                    return;
-                }
-                Bukkit.getScheduler().runTask(plugin, () -> {
-                    Execution execution = new Execution(header, prepared.planFile(), result, false, 0);
-                    activeExecutions.add(execution);
-                    execution.start();
-                });
+                scheduleExecution(new PendingStart(
+                    header, prepared.planFile(), result, false, 0
+                ));
             });
         return result;
     }
@@ -287,7 +292,7 @@ public final class RollbackService {
         requireServerThread();
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(operationId, "operationId");
-        return store.loadOperationSummary(operationId).thenCompose(optional -> {
+        CompletableFuture<OperationRunResult> recovery = store.loadOperationSummary(operationId).thenCompose(optional -> {
             OperationSummary summary = optional.orElseThrow(
                 () -> new IllegalArgumentException("복구할 History 작업을 찾지 못했습니다.")
             );
@@ -315,25 +320,9 @@ public final class RollbackService {
                         )).whenComplete((result, failure) -> OperationPlanSpool.delete(pending.planFile()));
                     }
                     CompletableFuture<OperationRunResult> result = new CompletableFuture<>();
-                    Runnable start = () -> {
-                        if (!plugin.isEnabled()) {
-                            OperationPlanSpool.delete(pending.planFile());
-                            result.completeExceptionally(recoveryFailure(
-                                operationId, "플러그인이 비활성화되어 복구를 시작하지 못했습니다.", null
-                            ));
-                            return;
-                        }
-                        Execution execution = new Execution(
-                            summary.header(), pending.planFile(), result, true, summary.appliedCount()
-                        );
-                        activeExecutions.add(execution);
-                        execution.start();
-                    };
-                    if (Bukkit.isPrimaryThread()) {
-                        start.run();
-                    } else {
-                        Bukkit.getScheduler().runTask(plugin, start);
-                    }
+                    scheduleExecution(new PendingStart(
+                        summary.header(), pending.planFile(), result, true, summary.appliedCount()
+                    ));
                     return result;
                 }).whenComplete((result, failure) -> {
                     if (failure != null) {
@@ -342,6 +331,7 @@ public final class RollbackService {
                     }
                 });
         });
+        return trackOperation(recovery);
     }
 
     public boolean cancelPreview(Player player, String token) {
@@ -350,17 +340,144 @@ public final class RollbackService {
 
     public CompletableFuture<Void> shutdown() {
         requireServerThread();
-        previews.close();
-        List<CompletableFuture<OperationRunResult>> results = new ArrayList<>();
-        for (Execution execution : List.copyOf(activeExecutions)) {
-            execution.abort("plugin-disabled");
-            results.add(execution.result);
+        if (shutdownFuture != null) {
+            return shutdownFuture;
         }
-        chunkLeases.close();
+        List<PendingStart> starts;
+        synchronized (executionLifecycle) {
+            shutdownRequested = true;
+            starts = List.copyOf(pendingStarts);
+            pendingStarts.clear();
+        }
+        Throwable shutdownFailure = null;
+        for (PendingStart pending : starts) {
+            try {
+                pending.cancelTask();
+                cancelBeforeExecution(pending);
+            } catch (RuntimeException failure) {
+                shutdownFailure = combineFailures(shutdownFailure, failure);
+                pending.result.completeExceptionally(failure);
+            }
+        }
+        try {
+            previews.close();
+        } catch (RuntimeException failure) {
+            shutdownFailure = combineFailures(shutdownFailure, failure);
+        }
+        for (Execution execution : List.copyOf(activeExecutions)) {
+            try {
+                execution.abort("plugin-disabled");
+            } catch (RuntimeException failure) {
+                shutdownFailure = combineFailures(shutdownFailure, failure);
+                execution.result.completeExceptionally(failure);
+            }
+        }
+        try {
+            chunkLeases.close();
+        } catch (RuntimeException failure) {
+            shutdownFailure = combineFailures(shutdownFailure, failure);
+        }
         CompletableFuture<Void> completion = CompletableFuture.allOf(
-            results.toArray(CompletableFuture[]::new)
+            List.copyOf(operationResults).toArray(CompletableFuture[]::new)
         );
-        return completion.whenComplete((unused, failure) -> planExecutor.shutdown());
+        if (shutdownFailure != null) {
+            Throwable terminalFailure = shutdownFailure;
+            completion = completion.handle((unused, operationFailure) -> {
+                if (operationFailure != null) {
+                    terminalFailure.addSuppressed(operationFailure);
+                }
+                throw new java.util.concurrent.CompletionException(terminalFailure);
+            });
+        }
+        shutdownFuture = completion
+            .orTimeout(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .whenComplete((unused, failure) -> {
+                if (failure == null) {
+                    planExecutor.shutdown();
+                } else {
+                    planExecutor.shutdownNow();
+                }
+            });
+        return shutdownFuture;
+    }
+
+    private CompletableFuture<OperationRunResult> trackOperation(
+        CompletableFuture<OperationRunResult> result
+    ) {
+        operationResults.add(result);
+        result.whenComplete((unused, failure) -> operationResults.remove(result));
+        return result;
+    }
+
+    private void scheduleExecution(PendingStart pending) {
+        boolean cancel;
+        RuntimeException schedulingFailure = null;
+        synchronized (executionLifecycle) {
+            cancel = shutdownRequested || !plugin.isEnabled();
+            if (!cancel && !Bukkit.isPrimaryThread()) {
+                pendingStarts.add(pending);
+                try {
+                    pending.task = Bukkit.getScheduler().runTask(plugin, () -> startPendingExecution(pending));
+                    return;
+                } catch (RuntimeException failure) {
+                    pendingStarts.remove(pending);
+                    cancel = true;
+                    schedulingFailure = failure;
+                }
+            }
+        }
+        if (cancel) {
+            cancelBeforeExecution(pending, schedulingFailure);
+        } else {
+            startExecution(pending);
+        }
+    }
+
+    private void startPendingExecution(PendingStart pending) {
+        requireServerThread();
+        boolean cancel;
+        synchronized (executionLifecycle) {
+            if (!pendingStarts.remove(pending)) {
+                return;
+            }
+            pending.task = null;
+            cancel = shutdownRequested || !plugin.isEnabled();
+        }
+        if (cancel) {
+            cancelBeforeExecution(pending, null);
+        } else {
+            startExecution(pending);
+        }
+    }
+
+    private void startExecution(PendingStart pending) {
+        requireServerThread();
+        Execution execution = new Execution(
+            pending.header,
+            pending.planFile,
+            pending.result,
+            pending.recovering,
+            pending.alreadyApplied
+        );
+        activeExecutions.add(execution);
+        execution.start();
+    }
+
+    private void cancelBeforeExecution(PendingStart pending) {
+        cancelBeforeExecution(pending, null);
+    }
+
+    private void cancelBeforeExecution(PendingStart pending, Throwable cause) {
+        if (pending.recovering) {
+            Throwable terminalCause = deletePlan(pending.planFile, cause);
+            pending.result.completeExceptionally(recoveryFailure(
+                pending.header.id(),
+                "플러그인 종료로 중단 작업 복구를 시작하지 못했습니다.",
+                terminalCause
+            ));
+        } else {
+            finalizeWithoutExecution(pending.header, pending.planFile, pending.result);
+        }
     }
 
     private void finalizeWithoutExecution(
@@ -376,9 +493,9 @@ public final class RollbackService {
             "plugin-disabled-before-execution"
         );
         store.finalizeOperation(finalization).whenComplete((unused, failure) -> {
-            OperationPlanSpool.delete(planFile);
-            if (failure != null) {
-                result.completeExceptionally(failure);
+            Throwable terminalFailure = deletePlan(planFile, failure);
+            if (terminalFailure != null) {
+                result.completeExceptionally(terminalFailure);
             } else {
                 result.complete(new OperationRunResult(
                     header.id(), OperationStatus.FAILED, 0, header.itemCount(), finalization.failure()
@@ -729,10 +846,10 @@ public final class RollbackService {
                 header.id(), System.currentTimeMillis(), status, skipped, firstFailure
             );
             store.finalizeOperation(finalization).whenComplete((unused, failure) -> {
-                OperationPlanSpool.delete(planFile);
-                if (failure != null) {
+                Throwable terminalFailure = deletePlan(planFile, failure);
+                if (terminalFailure != null) {
                     result.completeExceptionally(recoveryFailure(
-                        header.id(), "작업 완료 상태를 저장하지 못했습니다.", failure
+                        header.id(), "작업 완료 상태 저장 또는 계획 파일 정리에 실패했습니다.", terminalFailure
                     ));
                 } else {
                     result.complete(new OperationRunResult(
@@ -747,11 +864,11 @@ public final class RollbackService {
             closeCurrentChunk();
             closeReader();
             activeExecutions.remove(this);
-            OperationPlanSpool.delete(planFile);
+            Throwable terminalFailure = deletePlan(planFile, failure);
             result.completeExceptionally(recoveryFailure(
                 header.id(),
                 "월드 변경 뒤 체크포인트를 확정하지 못했습니다.",
-                failure
+                terminalFailure
             ));
         }
 
@@ -785,12 +902,42 @@ public final class RollbackService {
         }
 
         private void runOnServerForExecution(Runnable action) {
-            if (Bukkit.isPrimaryThread()) {
+            if (shutdownRequested || Bukkit.isPrimaryThread()) {
                 action.run();
             } else if (plugin.isEnabled()) {
                 Bukkit.getScheduler().runTask(plugin, action);
             } else {
                 action.run();
+            }
+        }
+    }
+
+    private static final class PendingStart {
+        private final OperationHeader header;
+        private final Path planFile;
+        private final CompletableFuture<OperationRunResult> result;
+        private final boolean recovering;
+        private final int alreadyApplied;
+        private BukkitTask task;
+
+        private PendingStart(
+            OperationHeader header,
+            Path planFile,
+            CompletableFuture<OperationRunResult> result,
+            boolean recovering,
+            int alreadyApplied
+        ) {
+            this.header = Objects.requireNonNull(header, "header");
+            this.planFile = Objects.requireNonNull(planFile, "planFile");
+            this.result = Objects.requireNonNull(result, "result");
+            this.recovering = recovering;
+            this.alreadyApplied = alreadyApplied;
+        }
+
+        private void cancelTask() {
+            if (task != null) {
+                task.cancel();
+                task = null;
             }
         }
     }
@@ -867,6 +1014,27 @@ public final class RollbackService {
         } catch (RuntimeException deleteFailure) {
             failure.addSuppressed(deleteFailure);
         }
+    }
+
+    private static Throwable deletePlan(Path planFile, Throwable failure) {
+        try {
+            OperationPlanSpool.delete(planFile);
+            return failure;
+        } catch (RuntimeException deleteFailure) {
+            if (failure != null) {
+                failure.addSuppressed(deleteFailure);
+                return failure;
+            }
+            return deleteFailure;
+        }
+    }
+
+    private static Throwable combineFailures(Throwable current, Throwable added) {
+        if (current == null) {
+            return added;
+        }
+        current.addSuppressed(added);
+        return current;
     }
 
     private static String shortId(UUID id) {

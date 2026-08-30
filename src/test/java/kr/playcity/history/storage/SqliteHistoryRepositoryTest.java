@@ -80,6 +80,37 @@ class SqliteHistoryRepositoryTest {
     }
 
     @Test
+    void isolatesIdenticalCoordinatesAcrossMultipleWorldsForLookupAndRollback() {
+        UUID secondWorld = UUID.fromString("30000000-0000-0000-0000-000000000099");
+        ChangeRecord primary = change(
+            WORLD_ID, 100L, 10, 64, 20, "minecraft:stone", "minecraft:gold_block"
+        );
+        ChangeRecord secondary = change(
+            secondWorld, 200L, 10, 64, 20, "minecraft:stone", "minecraft:diamond_block"
+        );
+        repository.insertBatch(List.of(primary, secondary));
+
+        List<ChangeRecord> primaryLookup = repository.query(
+            HistoryQuery.at(WORLD_ID, 10, 64, 20, 0L, 10)
+        );
+        List<ChangeRecord> secondaryLookup = repository.query(
+            HistoryQuery.at(secondWorld, 10, 64, 20, 0L, 10)
+        );
+        List<ChangeRecord> primaryRollback = new ArrayList<>();
+        repository.scanRollbackChanges(
+            HistoryQuery.nearby(WORLD_ID, 10, 20, 1, 0L, null, 128).forRollback(),
+            primaryRollback::add
+        );
+
+        assertEquals(1, primaryLookup.size());
+        assertEquals("minecraft:gold_block", primaryLookup.getFirst().after().blockData());
+        assertEquals(1, secondaryLookup.size());
+        assertEquals("minecraft:diamond_block", secondaryLookup.getFirst().after().blockData());
+        assertEquals(1, primaryRollback.size());
+        assertEquals(WORLD_ID, primaryRollback.getFirst().position().worldId());
+    }
+
+    @Test
     void keysetCursorReturnsEveryRecordWithoutDuplicatesAtEqualTimestamps() {
         List<ChangeRecord> inserted = new ArrayList<>();
         for (int index = 0; index < 5; index++) {
@@ -528,10 +559,22 @@ class SqliteHistoryRepositoryTest {
         String before,
         String after
     ) {
+        return change(WORLD_ID, time, x, y, z, before, after);
+    }
+
+    private static ChangeRecord change(
+        UUID worldId,
+        long time,
+        int x,
+        int y,
+        int z,
+        String before,
+        String after
+    ) {
         return new ChangeRecord(
             0L,
             time,
-            new BlockPosition(WORLD_ID, x, y, z),
+            new BlockPosition(worldId, x, y, z),
             ACTOR,
             ChangeCause.PLAYER_PLACE,
             BlockSnapshot.block(before),

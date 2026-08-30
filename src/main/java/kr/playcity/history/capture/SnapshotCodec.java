@@ -31,6 +31,11 @@ public final class SnapshotCodec {
         return capture(block.getState(false));
     }
 
+    /** Captures only public block data, avoiding block-entity serialization on broad interaction probes. */
+    public BlockSnapshot captureBlockData(Block block) {
+        return BlockSnapshot.block(block.getBlockData().getAsString(false));
+    }
+
     public BlockSnapshot capture(BlockState state) {
         String blockData = state.getBlockData().getAsString(false);
         try {

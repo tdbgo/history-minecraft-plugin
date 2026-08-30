@@ -27,6 +27,19 @@ public interface HistoryStore {
         return append(change);
     }
 
+    /**
+     * Appends an applied FAWE batch with bounded worker-side backpressure.
+     * Implementations must not call this waiting path from the server thread.
+     */
+    default boolean appendWorldEditBatch(List<ChangeRecord> changes) {
+        for (ChangeRecord change : changes) {
+            if (!appendWorldEdit(change)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** Attempts post-application capture without waiting for queue space. */
     default boolean tryAppendWorldEdit(ChangeRecord change) {
         return append(change);

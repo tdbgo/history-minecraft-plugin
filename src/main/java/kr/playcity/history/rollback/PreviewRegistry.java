@@ -6,14 +6,20 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class PreviewRegistry implements AutoCloseable {
     private static final char[] TOKEN_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz".toCharArray();
     private static final int TOKEN_LENGTH = 10;
     private final SecureRandom random = new SecureRandom();
     private final Map<String, PreparedRollbackPreview> previews = new ConcurrentHashMap<>();
+    private final AtomicBoolean closed = new AtomicBoolean();
 
     public RollbackPreview register(RollbackPreview preview, Path planFile) {
+        if (closed.get()) {
+            OperationPlanSpool.delete(planFile);
+            throw new IllegalStateException("History preview registry is closed");
+        }
         purgeExpired();
         String token;
         do {
@@ -32,7 +38,13 @@ public final class PreviewRegistry implements AutoCloseable {
             preview.conflicts(),
             preview.alreadyTarget()
         );
-        previews.put(token, new PreparedRollbackPreview(registered, planFile));
+        PreparedRollbackPreview prepared = new PreparedRollbackPreview(registered, planFile);
+        previews.put(token, prepared);
+        if (closed.get()) {
+            previews.remove(token, prepared);
+            OperationPlanSpool.delete(planFile);
+            throw new IllegalStateException("History preview registry closed during registration");
+        }
         return registered;
     }
 
@@ -73,8 +85,23 @@ public final class PreviewRegistry implements AutoCloseable {
 
     @Override
     public void close() {
-        previews.values().forEach(prepared -> OperationPlanSpool.delete(prepared.planFile()));
+        closed.set(true);
+        RuntimeException failure = null;
+        for (PreparedRollbackPreview prepared : previews.values()) {
+            try {
+                OperationPlanSpool.delete(prepared.planFile());
+            } catch (RuntimeException deleteFailure) {
+                if (failure == null) {
+                    failure = deleteFailure;
+                } else {
+                    failure.addSuppressed(deleteFailure);
+                }
+            }
+        }
         previews.clear();
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     private String newToken() {

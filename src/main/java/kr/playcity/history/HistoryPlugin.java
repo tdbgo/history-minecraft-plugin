@@ -21,9 +21,13 @@ import kr.playcity.history.storage.AsyncHistoryStore;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 
 public final class HistoryPlugin extends JavaPlugin {
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 60L;
     private AsyncHistoryStore store;
     private RollbackService rollbackService;
     private AutoCloseable worldEditIntegration;
@@ -106,16 +110,32 @@ public final class HistoryPlugin extends JavaPlugin {
         if (store == null) {
             return;
         }
+        java.util.concurrent.CompletableFuture<Void> shutdown;
         if (rollbackService == null) {
-            store.closeAsync();
-            return;
+            shutdown = store.closeAsync();
+        } else {
+            shutdown = rollbackService.shutdown().handle((unused, failure) -> {
+                if (failure != null) {
+                    getLogger().log(Level.SEVERE, "Unable to finalize an active History operation", failure);
+                }
+                return null;
+            }).thenCompose(unused -> store.closeAsync());
         }
-        rollbackService.shutdown().handle((unused, failure) -> {
-            if (failure != null) {
-                getLogger().log(Level.SEVERE, "Unable to finalize an active History operation", failure);
-            }
-            return null;
-        }).thenCompose(unused -> store.closeAsync());
+        try {
+            shutdown.get(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            getLogger().log(Level.SEVERE, "History shutdown was interrupted before storage closed", interrupted);
+        } catch (ExecutionException failure) {
+            getLogger().log(Level.SEVERE, "History could not flush and close its storage cleanly", failure.getCause());
+        } catch (TimeoutException timeout) {
+            getLogger().log(
+                Level.SEVERE,
+                "History storage did not close within " + SHUTDOWN_TIMEOUT_SECONDS
+                    + " seconds; inspect /history status and the preceding storage error",
+                timeout
+            );
+        }
     }
 
     private AutoCloseable enableWorldEditIntegration(HistoryConfig config, ChangeRecorder recorder) {

@@ -109,12 +109,19 @@ public final class ChangeRecorder {
 
     /** Records one already-applied FAWE chunk as an all-or-none queue admission. */
     public boolean recordAppliedFaweBatch(List<ChangeRecord> changes) {
+        return recordAppliedFaweBatch(changes, true);
+    }
+
+    /** Records a FAWE chunk, optionally waiting only when the caller is a non-server worker. */
+    public boolean recordAppliedFaweBatch(List<ChangeRecord> changes, boolean waitForCapacity) {
         if (changes.isEmpty()) {
             return true;
         }
         boolean recorded;
         try {
-            recorded = store.tryAppendWorldEditBatch(changes);
+            recorded = waitForCapacity
+                ? store.appendWorldEditBatch(changes)
+                : store.tryAppendWorldEditBatch(changes);
             for (ChangeRecord change : changes) {
                 positionGuard.markMutation(change.position());
             }

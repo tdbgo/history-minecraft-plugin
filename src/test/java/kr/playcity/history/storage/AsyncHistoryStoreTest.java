@@ -19,11 +19,13 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -32,6 +34,7 @@ import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -126,6 +129,42 @@ class AsyncHistoryStoreTest {
         assertFalse(store.status().operational());
         assertEquals(1L, store.status().rejected());
         store.closeAsync().get(5, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void startupFailureAccountsForEveryPreviouslyAcceptedQueuedChange() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("startup-failure.db"),
+            8,
+            4,
+            5_000,
+            1_000
+        );
+        TestRepository repository = new TestRepository(false, 0, true, true);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            assertTrue(repository.openStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(store.append(change(0)));
+            assertTrue(store.tryAppendWorldEditBatch(List.of(change(1), change(2))));
+
+            repository.releaseOpen.countDown();
+            await(() -> store.status().captureGapChanges() == 3L, Duration.ofSeconds(2));
+
+            StoreStatus status = store.status();
+            assertFalse(status.ready());
+            assertFalse(status.accepting());
+            assertFalse(status.healthy());
+            assertTrue(status.degraded());
+            assertFalse(status.captureComplete());
+            assertEquals(0, status.databaseQueued());
+            assertEquals(3L, status.accepted());
+            assertEquals(0L, status.persisted());
+            assertEquals(3L, status.captureGapChanges());
+            assertEquals(2L, status.worldEditCaptureGapChanges());
+        } finally {
+            repository.releaseOpen.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test
@@ -373,6 +412,119 @@ class AsyncHistoryStoreTest {
     }
 
     @Test
+    void workerBackpressureWaitsForCapacityAndPreservesTheAppliedFaweBatch() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            kr.playcity.history.config.StorageBackend.SQLITE,
+            temporaryDirectory.resolve("worldedit-worker-backpressure.db"),
+            HistoryConfig.Postgres.defaults(),
+            1,
+            1,
+            1,
+            20,
+            2_000,
+            1_000,
+            0,
+            10_000,
+            60
+        );
+        TestRepository repository = new TestRepository(true, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            assertTrue(store.tryAppendWorldEdit(change(0)));
+            assertTrue(repository.firstInsertStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(store.tryAppendWorldEdit(change(1)));
+
+            CompletableFuture<Boolean> admitted = CompletableFuture.supplyAsync(() ->
+                store.appendWorldEditBatch(List.of(change(2)))
+            );
+            Thread.sleep(50L);
+            assertFalse(admitted.isDone());
+
+            repository.releaseFirstInsert.countDown();
+            assertTrue(admitted.get(2, TimeUnit.SECONDS));
+            await(() -> store.status().persisted() == 3L, Duration.ofSeconds(2));
+            assertEquals(0L, store.status().captureGapEvents());
+        } finally {
+            repository.releaseFirstInsert.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void workerBackpressureStreamsABatchLargerThanInternalQueueCapacity() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            kr.playcity.history.config.StorageBackend.SQLITE,
+            temporaryDirectory.resolve("worldedit-large-worker-batch.db"),
+            HistoryConfig.Postgres.defaults(),
+            2,
+            2,
+            1,
+            20,
+            2_000,
+            1_000,
+            0,
+            10_000,
+            60
+        );
+        TestRepository repository = new TestRepository(false, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            List<ChangeRecord> changes = new ArrayList<>();
+            for (int index = 0; index < 17; index++) {
+                changes.add(change(index));
+            }
+            assertTrue(store.appendWorldEditBatch(changes));
+            await(() -> store.status().persisted() == 17L, Duration.ofSeconds(2));
+            assertEquals(0L, store.status().captureGapEvents());
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void oversizedWorkerBatchAccountsForEveryUncapturedTailAfterATimeout() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            kr.playcity.history.config.StorageBackend.SQLITE,
+            temporaryDirectory.resolve("worldedit-large-worker-gap.db"),
+            HistoryConfig.Postgres.defaults(),
+            2,
+            2,
+            1,
+            20,
+            100,
+            1_000,
+            0,
+            10_000,
+            60
+        );
+        TestRepository repository = new TestRepository(true, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            List<ChangeRecord> changes = new ArrayList<>();
+            for (int index = 0; index < 7; index++) {
+                changes.add(change(index));
+            }
+
+            CompletableFuture<Boolean> recorded = CompletableFuture.supplyAsync(() ->
+                store.appendWorldEditBatch(changes)
+            );
+            assertTrue(repository.firstInsertStarted.await(2, TimeUnit.SECONDS));
+            assertFalse(recorded.get(2, TimeUnit.SECONDS));
+
+            StoreStatus status = store.status();
+            assertEquals(4L, status.accepted());
+            assertEquals(3L, status.captureGapChanges());
+            assertEquals(2L, status.captureGapEvents());
+        } finally {
+            repository.releaseFirstInsert.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void admitsAppliedFaweChunkAsOneBoundedBatchWithoutAReservationLifecycle() throws Exception {
         HistoryConfig.Storage config = new HistoryConfig.Storage(
             kr.playcity.history.config.StorageBackend.SQLITE,
@@ -488,6 +640,231 @@ class AsyncHistoryStoreTest {
         }
     }
 
+    @Test
+    void concurrentCloseCallsFlushAndCloseTheRepositoryExactlyOnce() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("concurrent-close.db"),
+            32,
+            8,
+            20,
+            1_000
+        );
+        TestRepository repository = new TestRepository(false, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        await(() -> store.status().ready(), Duration.ofSeconds(2));
+        assertTrue(store.append(change(0)));
+
+        List<CompletableFuture<Void>> closes = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch start = new CountDownLatch(1);
+        List<Thread> callers = new ArrayList<>();
+        for (int index = 0; index < 32; index++) {
+            Thread caller = Thread.ofPlatform().unstarted(() -> {
+                try {
+                    start.await();
+                    closes.add(store.closeAsync());
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+            });
+            callers.add(caller);
+            caller.start();
+        }
+        start.countDown();
+        for (Thread caller : callers) {
+            caller.join();
+        }
+        CompletableFuture.allOf(closes.toArray(CompletableFuture[]::new)).get(5, TimeUnit.SECONDS);
+
+        assertEquals(32, closes.size());
+        assertTrue(closes.stream().allMatch(future -> future == closes.getFirst()));
+        assertEquals(1L, repository.persisted.get());
+        assertEquals(1, repository.closeAttempts.get());
+        assertEquals(0, store.status().databaseQueued());
+    }
+
+    @Test
+    void finalFlushFailureClosesRepositoryAndAccountsForEveryLostAcceptedChange() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("failed-close.db"),
+            8,
+            1,
+            20,
+            1_000
+        );
+        TestRepository repository = new TestRepository(true, 100);
+        AsyncHistoryStore store = new AsyncHistoryStore(config, Logger.getAnonymousLogger(), repository);
+        await(() -> store.status().ready(), Duration.ofSeconds(2));
+        assertTrue(store.append(change(0)));
+        assertTrue(repository.firstInsertStarted.await(2, TimeUnit.SECONDS));
+        assertTrue(store.append(change(1)));
+
+        CompletableFuture<Void> close = store.closeAsync();
+        repository.releaseFirstInsert.countDown();
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> close.get(5, TimeUnit.SECONDS));
+
+        StoreStatus status = store.status();
+        assertEquals(1, repository.closeAttempts.get());
+        assertEquals(0, status.databaseQueued());
+        assertEquals(2L, status.accepted());
+        assertEquals(0L, status.persisted());
+        assertEquals(2L, status.captureGapChanges());
+        assertFalse(status.captureComplete());
+        assertFalse(status.healthy());
+    }
+
+    @Test
+    void longRunningReadDoesNotBlockConcurrentHistoryPersistence() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("read-write-isolation.db"),
+            32,
+            8,
+            20,
+            1_000
+        );
+        TestRepository writer = new TestRepository(false, 0);
+        TestRepository reader = new TestRepository(false, 0, false, false, true);
+        AsyncHistoryStore store = new AsyncHistoryStore(
+            config,
+            Logger.getAnonymousLogger(),
+            writer,
+            reader
+        );
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            CompletableFuture<List<ChangeRecord>> query = store.query(
+                HistoryQuery.at(change(0).position().worldId(), 0, 64, 2, 0L, 10)
+            );
+            assertTrue(reader.queryStarted.await(2, TimeUnit.SECONDS));
+
+            assertTrue(store.append(change(0)));
+            await(() -> writer.persisted.get() == 1L, Duration.ofSeconds(2));
+            assertFalse(query.isDone());
+
+            reader.releaseQuery.countDown();
+            assertTrue(query.get(2, TimeUnit.SECONDS).isEmpty());
+        } finally {
+            reader.releaseQuery.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+        assertEquals(1, writer.closeAttempts.get());
+        assertEquals(1, reader.closeAttempts.get());
+    }
+
+    @Test
+    void readBarrierDoesNotWaitForTrafficAcceptedAfterTheQueryBegan() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("finite-read-barrier.db"),
+            64,
+            1,
+            20,
+            1_000
+        );
+        TestRepository writer = new TestRepository(true, 0);
+        TestRepository reader = new TestRepository(false, 0, false, false, true);
+        AsyncHistoryStore store = new AsyncHistoryStore(
+            config,
+            Logger.getAnonymousLogger(),
+            writer,
+            reader
+        );
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            assertTrue(store.append(change(0)));
+            assertTrue(writer.firstInsertStarted.await(2, TimeUnit.SECONDS));
+
+            CompletableFuture<List<ChangeRecord>> query = store.query(
+                HistoryQuery.at(change(0).position().worldId(), 0, 64, 2, 0L, 10)
+            );
+            for (int index = 1; index <= 16; index++) {
+                assertTrue(store.append(change(index)));
+            }
+            writer.releaseFirstInsert.countDown();
+
+            assertTrue(reader.queryStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(store.status().databaseQueued() > 0);
+            reader.releaseQuery.countDown();
+            assertTrue(query.get(2, TimeUnit.SECONDS).isEmpty());
+        } finally {
+            writer.releaseFirstInsert.countDown();
+            reader.releaseQuery.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+        assertEquals(17L, writer.persisted.get());
+    }
+
+    @Test
+    void writerPersistsStartupChangesWhileTheReadConnectionIsStillOpening() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("slow-reader-startup.db"),
+            32,
+            8,
+            20,
+            1_000
+        );
+        TestRepository writer = new TestRepository(false, 0);
+        TestRepository reader = new TestRepository(false, 0, true, false);
+        AsyncHistoryStore store = new AsyncHistoryStore(
+            config,
+            Logger.getAnonymousLogger(),
+            writer,
+            reader
+        );
+        try {
+            assertTrue(reader.openStarted.await(2, TimeUnit.SECONDS));
+            assertFalse(store.status().ready());
+            assertTrue(store.append(change(0)));
+            await(() -> writer.persisted.get() == 1L, Duration.ofSeconds(2));
+
+            reader.releaseOpen.countDown();
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            assertEquals(1L, store.status().persisted());
+            assertEquals(0L, store.status().captureGapEvents());
+        } finally {
+            reader.releaseOpen.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void readStartupFailureAccountsForAWriterRetryBatchWithoutLeavingBacklog() throws Exception {
+        HistoryConfig.Storage config = new HistoryConfig.Storage(
+            temporaryDirectory.resolve("reader-startup-failure.db"),
+            32,
+            1,
+            20,
+            1_000
+        );
+        TestRepository writer = new TestRepository(false, 100);
+        TestRepository reader = new TestRepository(false, 0, true, true);
+        AsyncHistoryStore store = new AsyncHistoryStore(
+            config,
+            Logger.getAnonymousLogger(),
+            writer,
+            reader
+        );
+        try {
+            assertTrue(reader.openStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(store.append(change(0)));
+            await(() -> writer.insertAttempts.get() >= 1, Duration.ofSeconds(2));
+
+            reader.releaseOpen.countDown();
+            await(
+                () -> store.status().captureGapChanges() == 1L && store.status().databaseQueued() == 0,
+                Duration.ofSeconds(2)
+            );
+            StoreStatus failed = store.status();
+            assertFalse(failed.ready());
+            assertFalse(failed.accepting());
+            assertEquals(1L, failed.accepted());
+            assertEquals(0L, failed.persisted());
+            assertFalse(failed.captureComplete());
+        } finally {
+            reader.releaseOpen.countDown();
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
     private static ChangeRecord change(int index) {
         return new ChangeRecord(
             0L,
@@ -521,15 +898,54 @@ class AsyncHistoryStoreTest {
         private final AtomicLong persisted = new AtomicLong();
         private final AtomicInteger operationFailuresRemaining = new AtomicInteger();
         private final AtomicInteger operationAttempts = new AtomicInteger();
+        private final AtomicInteger closeAttempts = new AtomicInteger();
         private final List<Integer> batchSizes = new ArrayList<>();
+        private final boolean blockOpen;
+        private final boolean failOpen;
+        private final boolean blockQuery;
+        private final CountDownLatch openStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseOpen = new CountDownLatch(1);
+        private final CountDownLatch queryStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseQuery = new CountDownLatch(1);
 
         private TestRepository(boolean blockFirstInsert, int failures) {
+            this(blockFirstInsert, failures, false, false, false);
+        }
+
+        private TestRepository(boolean blockFirstInsert, int failures, boolean blockOpen, boolean failOpen) {
+            this(blockFirstInsert, failures, blockOpen, failOpen, false);
+        }
+
+        private TestRepository(
+            boolean blockFirstInsert,
+            int failures,
+            boolean blockOpen,
+            boolean failOpen,
+            boolean blockQuery
+        ) {
             this.blockFirstInsert = blockFirstInsert;
             this.failuresRemaining = new AtomicInteger(failures);
+            this.blockOpen = blockOpen;
+            this.failOpen = failOpen;
+            this.blockQuery = blockQuery;
         }
 
         @Override
         public void open() {
+            openStarted.countDown();
+            if (blockOpen) {
+                try {
+                    if (!releaseOpen.await(5, TimeUnit.SECONDS)) {
+                        throw new StorageException("test repository open was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new StorageException("test repository open was interrupted", interrupted);
+                }
+            }
+            if (failOpen) {
+                throw new StorageException("test startup failure");
+            }
         }
 
         @Override
@@ -557,6 +973,17 @@ class AsyncHistoryStoreTest {
 
         @Override
         public List<ChangeRecord> query(HistoryQuery query) {
+            queryStarted.countDown();
+            if (blockQuery) {
+                try {
+                    if (!releaseQuery.await(5, TimeUnit.SECONDS)) {
+                        throw new StorageException("test query was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new StorageException("test query was interrupted", interrupted);
+                }
+            }
             return List.of();
         }
 
@@ -615,6 +1042,7 @@ class AsyncHistoryStoreTest {
 
         @Override
         public void close() {
+            closeAttempts.incrementAndGet();
         }
 
         private int maximumBatchSize() {

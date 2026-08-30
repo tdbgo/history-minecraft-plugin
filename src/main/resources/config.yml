@@ -12,8 +12,8 @@ storage:
   # lane is under sustained pressure, then returns to this low-latency size.
   batch-size: 512
   flush-interval-ms: 50
-  # Retained for alpha configuration compatibility. Production capture paths do
-  # not wait on this value or abort WorldEdit/FAWE edits.
+  # FAWE worker capture waits up to this long for bounded queue headroom.
+  # Server-thread WorldEdit fallback capture remains strictly non-blocking.
   worldedit-admission-timeout-ms: 30000
   sqlite:
     file: history.db
@@ -68,7 +68,7 @@ inspection:
 rollback:
   default-duration: 15m
   default-radius: 10
-  # Legacy alpha options retained for config compatibility. alpha.6 streams all
+  # Legacy alpha options retained for config compatibility. History streams all
   # matching records and one exact chunk at a time, so these are not hard caps.
   max-radius: 10000
   max-source-changes: 10000

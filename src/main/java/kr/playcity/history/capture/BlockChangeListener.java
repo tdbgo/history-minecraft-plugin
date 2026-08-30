@@ -7,6 +7,7 @@ import kr.playcity.history.model.BlockSnapshot;
 import kr.playcity.history.model.ChangeCause;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockState;
+import org.bukkit.block.data.Waterlogged;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -91,9 +92,7 @@ public final class BlockChangeListener implements Listener {
         if (!config.playerBlocks()) {
             return;
         }
-        // The actual post-break state may be water or another replacement block.
-        // Capture it on the following tick instead of assuming air.
-        recordActualNextTick(
+        recordDestroyedBlocks(
             List.of(event.getBlock()),
             actors.player(event.getPlayer()),
             ChangeCause.PLAYER_BREAK,
@@ -106,7 +105,7 @@ public final class BlockChangeListener implements Listener {
         if (!config.explosions()) {
             return;
         }
-        recordActualNextTick(
+        recordDestroyedBlocks(
             event.blockList(),
             actors.entity(event.getEntity()),
             ChangeCause.EXPLOSION,
@@ -119,7 +118,7 @@ public final class BlockChangeListener implements Listener {
         if (!config.explosions()) {
             return;
         }
-        recordActualNextTick(
+        recordDestroyedBlocks(
             event.blockList(),
             ActorRef.entity("#" + event.getBlock().getType().getKey().getKey()),
             ChangeCause.EXPLOSION,
@@ -130,7 +129,7 @@ public final class BlockChangeListener implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBurn(BlockBurnEvent event) {
         if (config.naturalChanges()) {
-            recordActualNextTick(
+            recordDestroyedBlocks(
                 List.of(event.getBlock()),
                 ActorRef.natural("#fire"),
                 ChangeCause.FIRE,
@@ -214,14 +213,26 @@ public final class BlockChangeListener implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPistonExtend(BlockPistonExtendEvent event) {
         if (config.pistons()) {
-            recordPistonMovement(event.getBlocks(), event.getDirection(), false, "extend");
+            recordPistonMovement(
+                event.getBlock(),
+                event.getBlocks(),
+                event.getDirection(),
+                event.getDirection(),
+                "extend"
+            );
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPistonRetract(BlockPistonRetractEvent event) {
         if (config.pistons()) {
-            recordPistonMovement(event.getBlocks(), event.getDirection(), true, "retract");
+            recordPistonMovement(
+                event.getBlock(),
+                event.getBlocks(),
+                event.getDirection().getOppositeFace(),
+                event.getDirection(),
+                "retract"
+            );
         }
     }
 
@@ -234,59 +245,42 @@ public final class BlockChangeListener implements Listener {
         recorder.record(block, actor, cause, snapshots.capture(block), snapshots.capture(newState), "");
     }
 
-    private void recordActualNextTick(
+    private void recordDestroyedBlocks(
         List<Block> blocks,
         ActorRef actor,
         ChangeCause cause,
         String metadata
     ) {
-        Map<BlockPosition, Block> uniqueBlocks = new LinkedHashMap<>();
-        Map<BlockPosition, BlockSnapshot> before = new LinkedHashMap<>();
+        Map<BlockPosition, Block> unique = new LinkedHashMap<>();
         for (Block block : blocks) {
-            BlockPosition position = position(block);
-            uniqueBlocks.putIfAbsent(position, block);
-            before.computeIfAbsent(position, ignored -> snapshots.capture(block));
+            unique.putIfAbsent(position(block), block);
         }
-        plugin.getServer().getScheduler().runTask(plugin, () -> {
-            for (Map.Entry<BlockPosition, BlockSnapshot> entry : before.entrySet()) {
-                recorder.record(
-                    entry.getKey(),
-                    actor,
-                    cause,
-                    entry.getValue(),
-                    snapshots.capture(uniqueBlocks.get(entry.getKey())),
-                    metadata
-                );
-            }
-        });
+        for (Map.Entry<BlockPosition, Block> entry : unique.entrySet()) {
+            Block block = entry.getValue();
+            BlockSnapshot before = snapshots.capture(block);
+            BlockSnapshot after = block.getBlockData() instanceof Waterlogged waterlogged && waterlogged.isWaterlogged()
+                ? BlockSnapshot.block("minecraft:water[level=0]")
+                : BlockSnapshot.air();
+            recorder.record(entry.getKey(), actor, cause, before, after, metadata);
+        }
     }
 
     private void recordPistonMovement(
+        Block piston,
         List<Block> movedBlocks,
-        org.bukkit.block.BlockFace direction,
-        boolean includeOpposite,
+        org.bukkit.block.BlockFace movementDirection,
+        org.bukkit.block.BlockFace pistonFacing,
         String metadata
     ) {
-        if (movedBlocks.isEmpty()) {
-            return;
-        }
         Map<BlockPosition, Block> blocks = new LinkedHashMap<>();
         Map<BlockPosition, BlockSnapshot> before = new LinkedHashMap<>();
 
+        rememberPistonBlock(piston, blocks, before);
+        rememberPistonBlock(piston.getRelative(pistonFacing), blocks, before);
+
         for (Block source : movedBlocks) {
-            Block destination = source.getRelative(direction);
-            BlockPosition sourcePosition = position(source);
-            BlockPosition destinationPosition = position(destination);
-            blocks.putIfAbsent(sourcePosition, source);
-            blocks.putIfAbsent(destinationPosition, destination);
-            before.computeIfAbsent(sourcePosition, ignored -> snapshots.capture(source));
-            before.computeIfAbsent(destinationPosition, ignored -> snapshots.capture(destination));
-            if (includeOpposite) {
-                Block opposite = source.getRelative(direction.getOppositeFace());
-                BlockPosition oppositePosition = position(opposite);
-                blocks.putIfAbsent(oppositePosition, opposite);
-                before.computeIfAbsent(oppositePosition, ignored -> snapshots.capture(opposite));
-            }
+            rememberPistonBlock(source, blocks, before);
+            rememberPistonBlock(source.getRelative(movementDirection), blocks, before);
         }
 
         ActorRef actor = ActorRef.natural("#piston");
@@ -302,6 +296,16 @@ public final class BlockChangeListener implements Listener {
                 );
             }
         });
+    }
+
+    private void rememberPistonBlock(
+        Block block,
+        Map<BlockPosition, Block> blocks,
+        Map<BlockPosition, BlockSnapshot> before
+    ) {
+        BlockPosition position = position(block);
+        blocks.putIfAbsent(position, block);
+        before.computeIfAbsent(position, ignored -> snapshots.capture(block));
     }
 
     private static BlockPosition position(Block block) {

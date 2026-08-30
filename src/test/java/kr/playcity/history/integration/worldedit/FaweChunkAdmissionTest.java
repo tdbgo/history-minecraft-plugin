@@ -15,9 +15,19 @@ class FaweChunkAdmissionTest {
     @Test
     void duplicatePostCallbackIsIdempotentAndOwnsNoReservation() {
         FaweChunkAdmission admission = new FaweChunkAdmission();
+        Object callback = new Object();
 
-        assertTrue(admission.beginPost(10L));
-        assertFalse(admission.beginPost(10L));
+        assertTrue(admission.beginPost(10L, callback));
+        assertFalse(admission.beginPost(10L, callback));
+        assertEquals(0, admission.pendingCount());
+    }
+
+    @Test
+    void distinctAppliedSetsForTheSameChunkAreNotDiscardedAsDuplicates() {
+        FaweChunkAdmission admission = new FaweChunkAdmission();
+
+        assertTrue(admission.beginPost(10L, new Object()));
+        assertTrue(admission.beginPost(10L, new Object()));
         assertEquals(0, admission.pendingCount());
     }
 
@@ -25,7 +35,7 @@ class FaweChunkAdmissionTest {
     void missingPostCallbackCannotLeakCapacity() {
         FaweChunkAdmission admission = new FaweChunkAdmission();
 
-        // alpha.6 does not register anything in processSet, so cancellation,
+        // processSet does not register anything, so cancellation,
         // delegate=false, exceptions and a missing post callback all leave zero.
         assertEquals(0, admission.pendingCount());
         admission.releaseAll();
@@ -41,15 +51,16 @@ class FaweChunkAdmissionTest {
         List<Thread> threads = new ArrayList<>();
         for (long chunk = 0; chunk < chunks; chunk++) {
             long key = chunk;
+            Object callback = new Object();
             Thread first = Thread.ofPlatform().unstarted(() -> {
                 await(start);
-                if (admission.beginPost(key)) {
+                if (admission.beginPost(key, callback)) {
                     admitted.add(key);
                 }
             });
             Thread duplicate = Thread.ofPlatform().unstarted(() -> {
                 await(start);
-                if (admission.beginPost(key)) {
+                if (admission.beginPost(key, callback)) {
                     admitted.add(key);
                 }
             });
@@ -71,11 +82,12 @@ class FaweChunkAdmissionTest {
     @Test
     void flushOnlyClearsBoundedDeduplicationState() {
         FaweChunkAdmission admission = new FaweChunkAdmission();
-        assertTrue(admission.beginPost(12L));
+        Object callback = new Object();
+        assertTrue(admission.beginPost(12L, callback));
 
         admission.releaseAll();
 
-        assertTrue(admission.beginPost(12L));
+        assertTrue(admission.beginPost(12L, callback));
         assertEquals(0, admission.pendingCount());
     }
 
