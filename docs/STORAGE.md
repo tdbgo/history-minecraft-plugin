@@ -2,7 +2,9 @@
 
 SQLite is the default backend. PostgreSQL is optional. PostgreSQL moves storage out of the Minecraft process, but it does not automatically use less disk space.
 
-Capture writes and history reads use separate database connections. Long lookups and rollback scans therefore do not stop the writer from draining its bounded queues. Each read first persists captures accepted before that read began, but it does not wait for newer continuous traffic to stop. SQLite uses WAL for concurrent readers; PostgreSQL uses an independent read connection.
+Capture first drains to `capture-journal.wal` on a dedicated worker. Database projection and history reads use separate connections and workers. Long lookups, rollback scans, a slow remote database, and a database connection that is unavailable during startup therefore do not stop the capture journal from draining the bounded memory queues. Failed writer and reader startup connections retry with bounded exponential backoff while capture remains available. Each read first persists captures accepted before that read began, but it does not wait for newer continuous traffic to stop. SQLite uses WAL for concurrent readers; PostgreSQL uses an independent read connection.
+
+The local capture journal uses length-delimited CRC32C frames and a forced checkpoint. An acknowledged empty journal is compacted back to its header. On restart, complete unacknowledged frames are replayed before History becomes ready. Every new capture has a durable UUID, so a database commit followed by a crash before journal acknowledgement is replayed idempotently instead of duplicated. A corrupt complete frame stops History rather than being skipped. An incomplete final crash frame is removed and reported as an unknown-size capture gap.
 
 ## Data reduction
 
@@ -25,7 +27,7 @@ History observes FAWE only in post-processing. It never holds queue permits acro
 
 The WorldEdit fallback delegates the mutation first and then performs a non-blocking capture attempt. A History failure is not propagated through the edit path.
 
-Direct server-thread capture never waits for a database round trip. Under sustained pressure, History expands database batches up to 8,192 records while preserving the separate queue lanes. If the direct lane still overflows, that record becomes a visible capture gap while later changes continue to be attempted. After the queue drains and storage is healthy, `/history resume` verifies the store and clears the active degraded state without erasing cumulative gap counters.
+Direct server-thread capture never waits for filesystem or database I/O. Under sustained pressure, History drains memory to the sequential journal independently of database projection and expands database batches up to 8,192 records. If the in-memory ingress lane itself still overflows before the journal worker can drain it, that record becomes a visible capture gap while later changes continue to be attempted. After the queue drains and storage is healthy, `/history resume` verifies the store and clears the active degraded state without erasing cumulative gap counters.
 
 Rollback queries do not use a total row or chunk cap. Matching rows are read with a bounded database fetch size, consolidated one block position at a time, and written to a verified temporary plan. The durable operation is then prepared in bounded batches and applied one exact chunk at a time. History checkpoints that chunk before loading the next one. If execution stops after world application but before a checkpoint is acknowledged, `/history recover <operation-id>` rebuilds the pending spool from the database and reconciles live `before`/`after` state. This keeps memory proportional to a database page and one target chunk instead of the total rollback area.
 
@@ -49,6 +51,6 @@ To use PostgreSQL, set `storage.backend: postgresql`. Prefer `password-env` over
 
 History does not automatically import CoreProtect data or transfer records between SQLite and PostgreSQL. Select the intended backend before production use.
 
-Monitor accepted, persisted, merged, direct rejects, capture-gap events/changes, database queue, pending external edits, interrupted operations, and purged counts. PostgreSQL operators should also monitor commit latency, WAL generation, and autovacuum lag.
+Monitor accepted, persisted, merged, direct rejects, capture-gap events/changes, volatile memory queue, durable journal/DB backlog and bytes, pending external edits, interrupted operations, and purged counts. PostgreSQL operators should also monitor commit latency, server WAL generation, and autovacuum lag.
 
-The in-process ingress queues are not a crash-proof write-ahead log. An unclean JVM or host failure can lose an accepted but not yet committed tail. This alpha reports detected pressure gaps, but a durable local ingress journal and idempotent PostgreSQL projection remain future hardening work.
+The Paper event path remains non-blocking. A forced process or host failure can therefore still lose the very small tail accepted into memory but not yet forced by the journal worker. Eliminating that final window would require synchronous disk I/O on the server thread or rejecting/cancelling world changes, both of which violate History's availability boundary. Everything already forced to the local journal survives database outages and normal or abnormal restarts.

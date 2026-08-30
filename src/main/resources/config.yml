@@ -11,6 +11,8 @@ storage:
   # Normal transaction size. History scales this up to 8,192 records while a
   # lane is under sustained pressure, then returns to this low-latency size.
   batch-size: 512
+  # Capture is first forced to plugins/History/capture-journal.wal by a
+  # dedicated worker. Database stalls do not consume this memory headroom.
   flush-interval-ms: 50
   # FAWE worker capture waits up to this long for bounded queue headroom.
   # Server-thread WorldEdit fallback capture remains strictly non-blocking.

@@ -2,7 +2,6 @@ package kr.playcity.history.storage;
 
 import kr.playcity.history.config.HistoryConfig;
 import kr.playcity.history.model.ChangeRecord;
-import kr.playcity.history.model.ChangeCause;
 import kr.playcity.history.model.HistoryQuery;
 import kr.playcity.history.model.BlockPosition;
 import kr.playcity.history.model.OperationCompletion;
@@ -44,9 +43,11 @@ public final class AsyncHistoryStore implements HistoryStore {
     private final ArrayBlockingQueue<ChangeRecord> directQueue;
     private final ArrayBlockingQueue<ChangeRecord> worldEditQueue;
     private final Semaphore worldEditCapacity;
+    private final ExecutorService journalExecutor;
     private final ExecutorService databaseExecutor;
     private final ExecutorService readExecutor;
     private final ScheduledExecutorService flushTimer;
+    private final CaptureJournal captureJournal;
     private final HistoryRepository writeRepository;
     private final HistoryRepository readRepository;
     private final boolean separateReadRepository;
@@ -56,12 +57,15 @@ public final class AsyncHistoryStore implements HistoryStore {
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final AtomicBoolean storageHealthy = new AtomicBoolean(true);
     private final AtomicBoolean degraded = new AtomicBoolean();
-    private final AtomicBoolean flushScheduled = new AtomicBoolean();
+    private final AtomicBoolean journalFlushScheduled = new AtomicBoolean();
+    private final AtomicBoolean databaseFlushScheduled = new AtomicBoolean();
     private final AtomicBoolean maintenanceScheduled = new AtomicBoolean();
     private final AtomicBoolean storageErrorLogged = new AtomicBoolean();
     private final AtomicBoolean captureErrorLogged = new AtomicBoolean();
     private final AtomicBoolean worldEditErrorLogged = new AtomicBoolean();
     private final AtomicLong accepted = new AtomicLong();
+    private final AtomicLong journaledAccepted = new AtomicLong();
+    private final AtomicLong databaseProcessedAccepted = new AtomicLong();
     private final AtomicLong persisted = new AtomicLong();
     private final AtomicLong compacted = new AtomicLong();
     private final AtomicLong rejected = new AtomicLong();
@@ -72,6 +76,8 @@ public final class AsyncHistoryStore implements HistoryStore {
     private final AtomicLong worldEditCaptureGapChanges = new AtomicLong();
     private final AtomicLong purged = new AtomicLong();
     private final AtomicInteger interruptedOperations = new AtomicInteger();
+    private final AtomicInteger consecutiveDatabaseFailures = new AtomicInteger();
+    private final AtomicLong nextDatabaseAttemptMillis = new AtomicLong();
     private final AtomicReference<String> storageError = new AtomicReference<>("");
     private final AtomicReference<String> captureError = new AtomicReference<>("");
     private final AtomicReference<String> worldEditError = new AtomicReference<>("");
@@ -80,7 +86,10 @@ public final class AsyncHistoryStore implements HistoryStore {
     private final ReentrantReadWriteLock admissionLifecycle = new ReentrantReadWriteLock();
     private final Lock admissionRead = admissionLifecycle.readLock();
     private final Lock admissionWrite = admissionLifecycle.writeLock();
+    private final CompletableFuture<Void> journalReadyFuture;
     private final CompletableFuture<Void> writeReadyFuture;
+    private final CompletableFuture<Void> captureReadyFuture;
+    private final CompletableFuture<Void> readReadyFuture;
     private final CompletableFuture<Void> readyFuture;
     private boolean preferWorldEdit = true;
 
@@ -121,6 +130,9 @@ public final class AsyncHistoryStore implements HistoryStore {
         this.directQueue = new ArrayBlockingQueue<>(config.queueCapacity());
         this.worldEditQueue = new ArrayBlockingQueue<>(config.worldEditQueueCapacity());
         this.worldEditCapacity = new Semaphore(config.worldEditQueueCapacity(), true);
+        this.journalExecutor = Executors.newSingleThreadExecutor(
+            Thread.ofPlatform().name("History-CaptureJournal").factory()
+        );
         this.databaseExecutor = Executors.newSingleThreadExecutor(
             Thread.ofPlatform().name("History-Database").factory()
         );
@@ -133,20 +145,59 @@ public final class AsyncHistoryStore implements HistoryStore {
         this.writeRepository = writeRepository;
         this.readRepository = readRepository;
         this.separateReadRepository = separateReadRepository;
-        this.writeReadyFuture = CompletableFuture.runAsync(() -> {
-            writeRepository.open();
-            interruptedOperations.set(writeRepository.interruptedOperationCount());
-        }, databaseExecutor);
-        this.readyFuture = writeReadyFuture
-            .thenCompose(unused -> separateReadRepository
-                ? CompletableFuture.runAsync(readRepository::open, readExecutor)
-                : CompletableFuture.completedFuture(null))
+        this.captureJournal = new CaptureJournal(
+            config.databaseFile().resolveSibling("capture-journal.wal")
+        );
+        this.journalReadyFuture = CompletableFuture.runAsync(() -> {
+            captureJournal.open();
+            if (captureJournal.truncatedTail()) {
+                reportCaptureGap(
+                    0L,
+                    "journal",
+                    "비정상 종료 뒤 캡처 저널의 불완전한 마지막 프레임을 제거했습니다. "
+                        + "해당 순간의 변경 수는 확인할 수 없습니다."
+                    );
+            }
+        }, journalExecutor).whenComplete((unused, failure) -> {
+            if (failure != null) {
+                markJournalFailure(failure);
+            }
+        });
+        this.writeReadyFuture = new CompletableFuture<>();
+        scheduleRepositoryOpen(writeRepository, writeReadyFuture, databaseExecutor, true, 1);
+        this.captureReadyFuture = CompletableFuture.allOf(writeReadyFuture, journalReadyFuture)
+            .thenRunAsync(this::flushRecoveredJournalOnDatabaseThread, databaseExecutor);
+        this.readReadyFuture = separateReadRepository
+            ? new CompletableFuture<>()
+            : CompletableFuture.completedFuture(null);
+        if (separateReadRepository) {
+            captureReadyFuture.whenComplete((unused, failure) -> {
+                if (failure != null) {
+                    readReadyFuture.completeExceptionally(unwrap(failure));
+                } else {
+                    scheduleRepositoryOpen(readRepository, readReadyFuture, readExecutor, false, 1);
+                }
+            });
+        }
+        this.readyFuture = CompletableFuture.allOf(captureReadyFuture, readReadyFuture)
             .thenRun(() -> {
                 ready.set(true);
+                storageHealthy.set(true);
+                storageError.set("");
+                storageErrorLogged.set(false);
             })
             .whenComplete((unused, failure) -> {
                 if (failure != null) {
-                    failStartup(failure);
+                    // Database/read startup failures must not discard the independent
+                    // capture path. A healthy local journal continues accepting changes
+                    // for replay after storage becomes available or the server restarts.
+                    markStorageFailure(failure);
+                    journalReadyFuture.thenRunAsync(this::flushAllIngressOnJournalThread, journalExecutor)
+                        .whenComplete((ignored, journalFailure) -> {
+                            if (journalFailure != null) {
+                                markJournalFailure(journalFailure);
+                            }
+                        });
                 }
             });
 
@@ -179,6 +230,11 @@ public final class AsyncHistoryStore implements HistoryStore {
     private boolean appendDirect(ChangeRecord change) {
         if (!accepting.get()) {
             rejected.incrementAndGet();
+            reportCaptureGap(
+                1L,
+                "direct",
+                "History가 기록을 수락하지 않는 동안 직접 변경이 발생했습니다. 저장소 상태를 확인하십시오."
+            );
             return false;
         }
         boolean offered = directQueue.offer(change);
@@ -254,7 +310,7 @@ public final class AsyncHistoryStore implements HistoryStore {
 
     private boolean tryAppendWorldEditBatchAfterStartupCheck(List<ChangeRecord> immutableChanges) {
         int changeCount = immutableChanges.size();
-        if (!accepting.get() || !storageHealthy.get()) {
+        if (!accepting.get()) {
             requestFlush();
             reportCaptureGap(
                 changeCount,
@@ -301,7 +357,7 @@ public final class AsyncHistoryStore implements HistoryStore {
         int changeCount = changes.size();
         admissionRead.lock();
         try {
-            if (!accepting.get() || !storageHealthy.get()) {
+            if (!accepting.get()) {
                 reportCaptureGap(
                     changeCount,
                     "worldedit",
@@ -335,12 +391,12 @@ public final class AsyncHistoryStore implements HistoryStore {
                 );
                 return false;
             }
-            if (!accepting.get() || !storageHealthy.get()) {
+            if (!accepting.get()) {
                 worldEditCapacity.release(changeCount);
                 reportCaptureGap(
                     changeCount,
                     "worldedit",
-                    "대기 중 저장소가 비정상 상태로 전환되어 WorldEdit/FAWE 기록을 수락하지 못했습니다."
+                    "대기 중 캡처 저널이 기록 수락을 중단하여 WorldEdit/FAWE 기록을 남기지 못했습니다."
                 );
                 return false;
             }
@@ -432,8 +488,7 @@ public final class AsyncHistoryStore implements HistoryStore {
     @Override
     public CompletableFuture<Void> prepareOperation(OperationDraft operation) {
         long acceptedBarrier = accepted.get();
-        return onDatabaseThread(() -> {
-            flushAcceptedThroughOnDatabaseThread(acceptedBarrier);
+        return onDatabaseThreadAfterBarrier(acceptedBarrier, () -> {
             writeRepository.prepareOperation(operation);
             return null;
         });
@@ -451,8 +506,7 @@ public final class AsyncHistoryStore implements HistoryStore {
             );
         }
         long acceptedBarrier = accepted.get();
-        return this.<Void>onDatabaseThread(() -> {
-            flushAcceptedThroughOnDatabaseThread(acceptedBarrier);
+        return this.<Void>onDatabaseThreadAfterBarrier(acceptedBarrier, () -> {
             writeRepository.prepareOperation(operation, items, batchSize);
             interruptedOperations.set(writeRepository.interruptedOperationCount());
             return null;
@@ -479,8 +533,7 @@ public final class AsyncHistoryStore implements HistoryStore {
     @Override
     public CompletableFuture<Void> completeOperation(OperationCompletion completion) {
         long acceptedBarrier = accepted.get();
-        return onDatabaseThread(() -> {
-            flushAcceptedThroughOnDatabaseThread(acceptedBarrier);
+        return onDatabaseThreadAfterBarrier(acceptedBarrier, () -> {
             writeRepository.completeOperation(completion);
             interruptedOperations.set(writeRepository.interruptedOperationCount());
             return null;
@@ -545,7 +598,9 @@ public final class AsyncHistoryStore implements HistoryStore {
             accepting.get(),
             storageHealthy.get(),
             degraded.get(),
+            (int) Math.min(Integer.MAX_VALUE, captureJournal.pendingCount()),
             directQueue.size() + worldEditQueue.size() + retrySize.get(),
+            captureJournal.backlogBytes(),
             reservations.count(),
             reservations.changes(),
             reservations.oldestAgeMillis(),
@@ -573,7 +628,9 @@ public final class AsyncHistoryStore implements HistoryStore {
                 "History is closing; capture cannot be resumed"
             ));
         }
-        return readyFuture.handleAsync((unused, startupFailure) -> {
+        return readyFuture
+            .thenCompose(unused -> CompletableFuture.runAsync(this::flushAllIngressOnJournalThread, journalExecutor))
+            .handleAsync((unused, startupFailure) -> {
             if (startupFailure != null || !ready.get()) {
                 return new CaptureRecoveryResult(
                     false,
@@ -587,7 +644,7 @@ public final class AsyncHistoryStore implements HistoryStore {
                 );
             }
             try {
-                flushAllOnDatabaseThread();
+                flushAllJournalOnDatabaseThread();
                 interruptedOperations.set(writeRepository.interruptedOperationCount());
             } catch (RuntimeException failure) {
                 markStorageFailure(failure);
@@ -596,7 +653,7 @@ public final class AsyncHistoryStore implements HistoryStore {
                     "History storage verification failed; capture remains halted"
                 );
             }
-            if (hasPendingWrites() || !externalCaptures.isEmpty()) {
+            if (hasPendingIngress() || captureJournal.pendingCount() > 0L || !externalCaptures.isEmpty()) {
                 return new CaptureRecoveryResult(
                     false,
                     "History still has database writes or unconfirmed external-edit callbacks; wait for them to drain"
@@ -637,33 +694,43 @@ public final class AsyncHistoryStore implements HistoryStore {
             admissionWrite.unlock();
         }
         abandonAllExternalCaptures("서버 종료 전에 FAWE 후처리 콜백 완료를 확인하지 못했습니다.");
+        StorageException closing = new StorageException("History storage is closing");
+        writeReadyFuture.completeExceptionally(closing);
+        readReadyFuture.completeExceptionally(closing);
         flushTimer.shutdown();
-        CompletableFuture<Void> writeClose = readyFuture.handle((unused, failure) -> null)
-            .thenRunAsync(() -> {
-                if (ready.get()) {
-                    RuntimeException flushFailure = null;
-                    try {
-                        flushAllOnDatabaseThread();
-                    } catch (RuntimeException failure) {
-                        flushFailure = failure;
-                        discardPendingWritesAfterFinalFlushFailure();
-                    }
-                    try {
-                        writeRepository.close();
-                    } catch (RuntimeException closeFailure) {
-                        if (flushFailure != null) {
-                            flushFailure.addSuppressed(closeFailure);
-                        } else {
-                            flushFailure = closeFailure;
-                        }
-                    }
-                    if (flushFailure != null) {
-                        throw flushFailure;
-                    }
-                } else {
-                    writeRepository.close();
+        AtomicReference<Throwable> journalDrainFailure = new AtomicReference<>();
+        CompletableFuture<Void> journalDrain = journalReadyFuture
+            .thenRunAsync(this::flushAllIngressOnJournalThread, journalExecutor)
+            .exceptionally(failure -> {
+                journalDrainFailure.set(unwrap(failure));
+                return null;
+            });
+        CompletableFuture<Void> writeClose = CompletableFuture.allOf(
+            journalDrain,
+            readyFuture.handle((unused, failure) -> null)
+        ).thenRunAsync(() -> {
+            Throwable failure = journalDrainFailure.get();
+            if (failure == null && ready.get()) {
+                try {
+                    flushAllJournalOnDatabaseThread();
+                } catch (RuntimeException databaseFailure) {
+                    markStorageFailure(databaseFailure);
+                    logger.log(
+                        Level.WARNING,
+                        "History database flush failed during shutdown; durable journal backlog will replay next start",
+                        databaseFailure
+                    );
                 }
-            }, databaseExecutor);
+            }
+            try {
+                writeRepository.close();
+            } catch (RuntimeException closeFailure) {
+                failure = combineFailures(failure, closeFailure);
+            }
+            if (failure != null) {
+                throw new CompletionException(failure);
+            }
+        }, databaseExecutor);
         writeClose.handleAsync((unused, writeFailure) -> {
             Throwable failure = writeFailure == null ? null : unwrap(writeFailure);
             if (separateReadRepository) {
@@ -681,8 +748,20 @@ public final class AsyncHistoryStore implements HistoryStore {
                 throw new CompletionException(failure);
             }
             return null;
-        }, readExecutor)
+        }, readExecutor).handleAsync((unused, priorFailure) -> {
+            Throwable failure = priorFailure == null ? null : unwrap(priorFailure);
+            try {
+                captureJournal.close();
+            } catch (RuntimeException journalFailure) {
+                failure = combineFailures(failure, journalFailure);
+            }
+            if (failure != null) {
+                throw new CompletionException(failure);
+            }
+            return null;
+        }, journalExecutor)
             .whenComplete((unused, failure) -> {
+                journalExecutor.shutdown();
                 databaseExecutor.shutdown();
                 if (separateReadRepository) {
                     readExecutor.shutdown();
@@ -698,15 +777,42 @@ public final class AsyncHistoryStore implements HistoryStore {
     }
 
     private void requestFlush() {
-        if (accepting.get() && closeFuture.get() == null
-            && hasPendingWrites() && flushScheduled.compareAndSet(false, true)) {
-            writeReadyFuture.thenRunAsync(this::flushOneBatchOnDatabaseThread, databaseExecutor)
+        requestJournalFlush();
+        requestDatabaseFlush();
+    }
+
+    private void requestJournalFlush() {
+        if (closeFuture.get() == null && hasPendingIngress()
+            && journalFlushScheduled.compareAndSet(false, true)) {
+            journalReadyFuture.thenRunAsync(this::journalOneBatch, journalExecutor)
                 .whenComplete((unused, failure) -> {
-                    flushScheduled.set(false);
+                    journalFlushScheduled.set(false);
+                    if (failure != null) {
+                        markJournalFailure(failure);
+                    } else {
+                        requestDatabaseFlush();
+                        if (hasPendingIngress()) {
+                            requestJournalFlush();
+                        }
+                    }
+                });
+        }
+    }
+
+    private void requestDatabaseFlush() {
+        if (closeFuture.get() == null && captureJournal.pendingCount() > 0L
+            && System.currentTimeMillis() >= nextDatabaseAttemptMillis.get()
+            && databaseFlushScheduled.compareAndSet(false, true)) {
+            captureReadyFuture.thenRunAsync(this::flushOneJournalBatchOnDatabaseThread, databaseExecutor)
+                .whenComplete((unused, failure) -> {
+                    databaseFlushScheduled.set(false);
                     if (failure != null) {
                         markStorageFailure(failure);
-                    } else if (!worldEditQueue.isEmpty() || directQueue.size() >= config.batchSize()) {
-                        requestFlush();
+                        int failures = consecutiveDatabaseFailures.incrementAndGet();
+                        long delay = Math.min(30_000L, 250L << Math.min(failures - 1, 7));
+                        nextDatabaseAttemptMillis.set(System.currentTimeMillis() + delay);
+                    } else if (captureJournal.pendingCount() > 0L) {
+                        requestDatabaseFlush();
                     }
                 });
         }
@@ -730,9 +836,80 @@ public final class AsyncHistoryStore implements HistoryStore {
         });
     }
 
-    private void flushAllOnDatabaseThread() {
-        while (hasPendingWrites()) {
-            flushOneBatchOnDatabaseThread();
+    private void scheduleRepositoryOpen(
+        HistoryRepository repository,
+        CompletableFuture<Void> opened,
+        ExecutorService executor,
+        boolean writer,
+        int attempt
+    ) {
+        if (opened.isDone()) {
+            return;
+        }
+        if (closeFuture.get() != null) {
+            opened.completeExceptionally(new StorageException("History storage closed before it became ready"));
+            return;
+        }
+        try {
+            executor.execute(() -> {
+                if (opened.isDone() || closeFuture.get() != null) {
+                    return;
+                }
+                try {
+                    repository.open();
+                    if (writer) {
+                        interruptedOperations.set(repository.interruptedOperationCount());
+                    }
+                    opened.complete(null);
+                } catch (RuntimeException failure) {
+                    markStorageFailure(failure);
+                    long delay = Math.min(30_000L, 250L << Math.min(attempt - 1, 7));
+                    try {
+                        flushTimer.schedule(
+                            () -> scheduleRepositoryOpen(
+                                repository,
+                                opened,
+                                executor,
+                                writer,
+                                Math.min(128, attempt + 1)
+                            ),
+                            delay,
+                            TimeUnit.MILLISECONDS
+                        );
+                    } catch (RuntimeException schedulingFailure) {
+                        if (closeFuture.get() != null) {
+                            opened.completeExceptionally(failure);
+                        } else {
+                            failure.addSuppressed(schedulingFailure);
+                            opened.completeExceptionally(failure);
+                        }
+                    }
+                }
+            });
+        } catch (RuntimeException rejected) {
+            opened.completeExceptionally(rejected);
+        }
+    }
+
+    private void flushAllIngressOnJournalThread() {
+        while (hasPendingIngress()) {
+            journalOneBatch();
+        }
+    }
+
+    private void flushRecoveredJournalOnDatabaseThread() {
+        while (captureJournal.pendingCount() > 0L) {
+            CaptureJournal.JournalBatch batch = captureJournal.readBatch(8_192);
+            if (batch.changes().isEmpty() || !batch.replayed()) {
+                return;
+            }
+            persistJournalBatch(batch);
+        }
+    }
+
+    private void flushAllJournalOnDatabaseThread() {
+        while (captureJournal.pendingCount() > 0L) {
+            flushOneJournalBatchOnDatabaseThread();
         }
     }
 
@@ -741,18 +918,29 @@ public final class AsyncHistoryStore implements HistoryStore {
      * waiting forever for newer live traffic. This gives reads and operation
      * preparation a stable invocation-time view on continuously busy servers.
      */
-    private void flushAcceptedThroughOnDatabaseThread(long acceptedBarrier) {
-        while (processedAcceptedCount() < acceptedBarrier) {
-            if (!hasPendingWrites()) {
+    private void flushIngressThroughOnJournalThread(long acceptedBarrier) {
+        while (journaledAccepted.get() < acceptedBarrier) {
+            if (!hasPendingIngress()) {
                 throw new StorageException(
-                    "History accepted-write accounting fell behind its persistence barrier"
+                    "History accepted-write accounting fell behind its journal barrier"
                 );
             }
-            flushOneBatchOnDatabaseThread();
+            journalOneBatch();
         }
     }
 
-    private void flushOneBatchOnDatabaseThread() {
+    private void flushAcceptedThroughOnDatabaseThread(long acceptedBarrier) {
+        while (databaseProcessedAccepted.get() < acceptedBarrier) {
+            if (captureJournal.pendingCount() == 0L) {
+                throw new StorageException(
+                    "History journal accounting fell behind its database barrier"
+                );
+            }
+            flushOneJournalBatchOnDatabaseThread();
+        }
+    }
+
+    private void journalOneBatch() {
         List<ChangeRecord> batch = new ArrayList<>();
         if (!retryBatch.isEmpty()) {
             batch.addAll(retryBatch);
@@ -773,13 +961,8 @@ public final class AsyncHistoryStore implements HistoryStore {
             return;
         }
         try {
-            List<ChangeRecord> compactedBatch = WorldEditBatchCompactor.compact(batch);
-            writeRepository.insertBatch(compactedBatch);
-            persisted.addAndGet(compactedBatch.size());
-            compacted.addAndGet(batch.size() - compactedBatch.size());
-            storageHealthy.set(true);
-            storageError.set("");
-            storageErrorLogged.set(false);
+            captureJournal.append(batch);
+            journaledAccepted.addAndGet(batch.size());
         } catch (RuntimeException failure) {
             retryBatch.addAll(batch);
             retrySize.set(retryBatch.size());
@@ -787,12 +970,42 @@ public final class AsyncHistoryStore implements HistoryStore {
         }
     }
 
-    private boolean hasPendingWrites() {
-        return !directQueue.isEmpty() || !worldEditQueue.isEmpty() || !retryBatch.isEmpty();
+    private void flushOneJournalBatchOnDatabaseThread() {
+        CaptureJournal.JournalBatch batch = captureJournal.readBatch(8_192);
+        if (!batch.changes().isEmpty()) {
+            persistJournalBatch(batch);
+        }
     }
 
-    private long processedAcceptedCount() {
-        return persisted.get() + compacted.get();
+    private void persistJournalBatch(CaptureJournal.JournalBatch batch) {
+        List<ChangeRecord> compactedBatch = WorldEditBatchCompactor.compact(batch.changes());
+        try {
+            if (batch.replayed()) {
+                writeRepository.insertBatchIdempotent(compactedBatch);
+            } else {
+                writeRepository.insertBatch(compactedBatch);
+            }
+            captureJournal.acknowledge(batch);
+        } catch (RuntimeException failure) {
+            try {
+                captureJournal.requireIdempotentRetry(batch);
+            } catch (RuntimeException markerFailure) {
+                failure.addSuppressed(markerFailure);
+            }
+            throw failure;
+        }
+        persisted.addAndGet(compactedBatch.size());
+        compacted.addAndGet(batch.changes().size() - compactedBatch.size());
+        if (!batch.replayed()) {
+            databaseProcessedAccepted.addAndGet(batch.changes().size());
+        }
+        markStorageSuccessIfFullyAvailable();
+        consecutiveDatabaseFailures.set(0);
+        nextDatabaseAttemptMillis.set(0L);
+    }
+
+    private boolean hasPendingIngress() {
+        return !directQueue.isEmpty() || !worldEditQueue.isEmpty() || !retryBatch.isEmpty();
     }
 
     private <T> CompletableFuture<T> onDatabaseThread(DatabaseOperation<T> operation) {
@@ -804,13 +1017,32 @@ public final class AsyncHistoryStore implements HistoryStore {
             });
     }
 
+    private <T> CompletableFuture<T> onDatabaseThreadAfterBarrier(
+        long acceptedBarrier,
+        DatabaseOperation<T> operation
+    ) {
+        return readyFuture
+            .thenCompose(unused -> CompletableFuture.runAsync(
+                () -> flushIngressThroughOnJournalThread(acceptedBarrier), journalExecutor
+            ))
+            .thenApplyAsync(unused -> {
+                flushAcceptedThroughOnDatabaseThread(acceptedBarrier);
+                return operation.run();
+            }, databaseExecutor)
+            .whenComplete((unused, failure) -> {
+                if (failure != null) {
+                    markStorageFailure(failure);
+                }
+            });
+    }
+
     private <T> CompletableFuture<T> onReadThread(DatabaseOperation<T> operation) {
         long acceptedBarrier = accepted.get();
         return readyFuture
             .thenCompose(unused -> CompletableFuture.runAsync(
-                () -> flushAcceptedThroughOnDatabaseThread(acceptedBarrier),
-                databaseExecutor
+                () -> flushIngressThroughOnJournalThread(acceptedBarrier), journalExecutor
             ))
+            .thenRunAsync(() -> flushAcceptedThroughOnDatabaseThread(acceptedBarrier), databaseExecutor)
             .thenApplyAsync(unused -> operation.run(), readExecutor)
             .whenComplete((unused, failure) -> {
                 if (failure != null) {
@@ -847,9 +1079,7 @@ public final class AsyncHistoryStore implements HistoryStore {
             databaseExecutor.execute(() -> {
                 try {
                     operation.run();
-                    storageHealthy.set(true);
-                    storageError.set("");
-                    storageErrorLogged.set(false);
+                    markStorageSuccessIfFullyAvailable();
                     result.complete(null);
                 } catch (RuntimeException failure) {
                     markStorageFailure(failure);
@@ -895,70 +1125,28 @@ public final class AsyncHistoryStore implements HistoryStore {
         logErrorOnce(storageErrorLogged, "History storage entered a degraded state", root);
     }
 
-    private void failStartup(Throwable failure) {
+    private void markStorageSuccessIfFullyAvailable() {
+        if (separateReadRepository && !ready.get()) {
+            return;
+        }
+        storageHealthy.set(true);
+        storageError.set("");
+        storageErrorLogged.set(false);
+    }
+
+    private void markJournalFailure(Throwable failure) {
         admissionWrite.lock();
         try {
             accepting.set(false);
         } finally {
             admissionWrite.unlock();
         }
-        markStorageFailure(failure);
-        CompletableFuture.runAsync(() -> discardPendingWrites(
-            "저장소 시작에 실패하여 시작 중 수락했던 직접 변경을 저장하지 못했습니다. "
-                + "원인을 해결하고 서버를 정상 재시작하십시오.",
-            "저장소 시작에 실패하여 시작 중 수락했던 WorldEdit/FAWE 변경을 저장하지 못했습니다. "
-                + "편집 결과는 유지되지만 해당 기록은 복구할 수 없습니다."
-        ), databaseExecutor).whenComplete((unused, cleanupFailure) -> {
-            if (cleanupFailure != null) {
-                markStorageFailure(cleanupFailure);
-            }
-        });
-    }
-
-    private static long drainLostStartupChanges(ArrayBlockingQueue<ChangeRecord> queue) {
-        long drained = 0L;
-        while (queue.poll() != null) {
-            drained++;
-        }
-        return drained;
-    }
-
-    private void discardPendingWritesAfterFinalFlushFailure() {
-        discardPendingWrites(
-            "서버 종료 시 저장소의 최종 기록에 실패하여 직접 변경을 저장하지 못했습니다. "
-                + "직전 저장소 오류를 확인하십시오.",
-            "서버 종료 시 저장소의 최종 기록에 실패하여 WorldEdit/FAWE 변경을 저장하지 못했습니다. "
-                + "편집 결과는 유지되지만 해당 기록은 복구할 수 없습니다."
-        );
-    }
-
-    private void discardPendingWrites(String directReason, String worldEditReason) {
-        long directLost = drainLostStartupChanges(directQueue);
-        long worldEditLost = drainLostStartupChanges(worldEditQueue);
-        worldEditCapacity.release((int) worldEditLost);
-        for (ChangeRecord change : retryBatch) {
-            if (change.cause() == ChangeCause.WORLD_EDIT) {
-                worldEditLost++;
-            } else {
-                directLost++;
-            }
-        }
-        retryBatch.clear();
-        retrySize.set(0);
-        if (directLost > 0L) {
-            reportCaptureGap(
-                directLost,
-                "direct",
-                directReason + " 손실 " + directLost + "건."
-            );
-        }
-        if (worldEditLost > 0L) {
-            reportCaptureGap(
-                worldEditLost,
-                "worldedit",
-                worldEditReason + " 손실 " + worldEditLost + "건."
-            );
-        }
+        degraded.set(true);
+        Throwable root = unwrap(failure);
+        String message = "Capture journal " + root.getClass().getSimpleName()
+            + (root.getMessage() == null ? "" : ": " + root.getMessage());
+        captureError.set(message);
+        logErrorOnce(captureErrorLogged, "History capture journal stopped accepting changes", root);
     }
 
     private void enqueueWorldEditBatch(List<ChangeRecord> changes) {
@@ -1061,6 +1249,14 @@ public final class AsyncHistoryStore implements HistoryStore {
                 || current instanceof java.util.concurrent.ExecutionException)) {
             current = current.getCause();
         }
+        return current;
+    }
+
+    private static Throwable combineFailures(Throwable current, Throwable added) {
+        if (current == null) {
+            return added;
+        }
+        current.addSuppressed(added);
         return current;
     }
 

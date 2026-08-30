@@ -111,6 +111,27 @@ class SqliteHistoryRepositoryTest {
     }
 
     @Test
+    void replayedCaptureIdentityIsInsertedExactlyOnce() throws Exception {
+        ChangeRecord original = change(
+            WORLD_ID, 300L, 12, 65, 21, "minecraft:stone", "minecraft:emerald_block"
+        );
+        repository.insertBatch(List.of(original));
+        repository.insertBatchIdempotent(List.of(original, original));
+
+        List<ChangeRecord> stored = repository.query(
+            HistoryQuery.at(WORLD_ID, 12, 65, 21, 0L, 10)
+        );
+        assertEquals(1, stored.size());
+        try (Connection inspection = DriverManager.getConnection(
+            "jdbc:sqlite:" + temporaryDirectory.resolve("history.db").toAbsolutePath()
+        ); Statement statement = inspection.createStatement()) {
+            assertEquals(1L, scalar(statement, "SELECT COUNT(*) FROM changes"));
+            assertEquals(2L, scalar(statement, "SELECT SUM(reference_count) FROM block_states"));
+            assertEquals(1L, scalar(statement, "SELECT SUM(change_count) FROM storage_metrics"));
+        }
+    }
+
+    @Test
     void keysetCursorReturnsEveryRecordWithoutDuplicatesAtEqualTimestamps() {
         List<ChangeRecord> inserted = new ArrayList<>();
         for (int index = 0; index < 5; index++) {
@@ -316,9 +337,43 @@ class SqliteHistoryRepositoryTest {
 
         try (Connection inspection = DriverManager.getConnection("jdbc:sqlite:" + versionTwoFile.toAbsolutePath());
              Statement statement = inspection.createStatement()) {
-            assertEquals(4L, scalar(statement, "PRAGMA user_version"));
+            assertEquals(5L, scalar(statement, "PRAGMA user_version"));
             assertEquals(2L, scalar(statement, "SELECT SUM(reference_count) FROM block_states"));
             assertEquals(1L, scalar(statement, "SELECT COUNT(*) FROM storage_metrics"));
+        }
+    }
+
+    @Test
+    void migratesVersionFourDatabaseToDurableCaptureIdentityWithoutChangingExistingRows() throws Exception {
+        repository.insertBatch(List.of(change(
+            100L, 10, 64, 10, "minecraft:stone", "minecraft:dirt"
+        )));
+        repository.close();
+        Path database = temporaryDirectory.resolve("history.db");
+        try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + database.toAbsolutePath());
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("DROP INDEX changes_capture_uuid");
+            statement.executeUpdate("ALTER TABLE changes DROP COLUMN capture_uuid");
+            statement.executeUpdate("PRAGMA user_version=4");
+        }
+
+        repository = new SqliteHistoryRepository(database, 1_000);
+        repository.open();
+        ChangeRecord next = change(
+            200L, 11, 64, 10, "minecraft:dirt", "minecraft:gold_block"
+        );
+        repository.insertBatchIdempotent(List.of(next, next));
+
+        try (Connection inspection = DriverManager.getConnection("jdbc:sqlite:" + database.toAbsolutePath());
+             Statement statement = inspection.createStatement()) {
+            assertEquals(5L, scalar(statement, "PRAGMA user_version"));
+            assertEquals(2L, scalar(statement, "SELECT COUNT(*) FROM changes"));
+            assertEquals(1L, scalar(statement, "SELECT COUNT(*) FROM changes WHERE capture_uuid IS NULL"));
+            assertEquals(1L, scalar(statement, "SELECT COUNT(*) FROM changes WHERE capture_uuid IS NOT NULL"));
+            assertEquals(1L, scalar(statement, """
+                SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'changes_capture_uuid'
+                """));
         }
     }
 
@@ -376,7 +431,7 @@ class SqliteHistoryRepositoryTest {
         assertEquals("minecraft:oak_planks", migrated.getFirst().after().blockData());
         try (Connection inspection = DriverManager.getConnection("jdbc:sqlite:" + legacyFile.toAbsolutePath());
              Statement statement = inspection.createStatement()) {
-            assertEquals(4L, scalar(statement, "PRAGMA user_version"));
+            assertEquals(5L, scalar(statement, "PRAGMA user_version"));
             assertEquals("blob", textScalar(statement, "SELECT typeof(uuid) FROM worlds LIMIT 1"));
             assertEquals(0L, scalar(statement, "SELECT COUNT(*) FROM storage_metrics"));
         }

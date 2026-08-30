@@ -25,15 +25,15 @@ class WorldEditBatchCompactorTest {
 
     @Test
     void mergesAContinuousTransitionInsideOneBatch() {
-        List<ChangeRecord> compacted = WorldEditBatchCompactor.compact(List.of(
-            worldEdit(1L, "minecraft:stone", "minecraft:dirt"),
-            worldEdit(2L, "minecraft:dirt", "minecraft:gold_block")
-        ));
+        ChangeRecord first = worldEdit(1L, "minecraft:stone", "minecraft:dirt");
+        ChangeRecord latest = worldEdit(2L, "minecraft:dirt", "minecraft:gold_block");
+        List<ChangeRecord> compacted = WorldEditBatchCompactor.compact(List.of(first, latest));
 
         assertEquals(1, compacted.size());
         assertEquals("minecraft:stone", compacted.getFirst().before().blockData());
         assertEquals("minecraft:gold_block", compacted.getFirst().after().blockData());
         assertEquals(2L, compacted.getFirst().occurredAt());
+        assertEquals(latest.captureId(), compacted.getFirst().captureId());
     }
 
     @Test

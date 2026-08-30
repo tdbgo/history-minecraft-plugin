@@ -132,7 +132,10 @@ public final class HistoryUi {
     public static Component status(StoreStatus status) {
         NamedTextColor healthColor;
         String heading;
-        if (!status.healthy()) {
+        if (!status.healthy() && status.accepting()) {
+            healthColor = NamedTextColor.YELLOW;
+            heading = "DB 오류 · 내구 저널 수락 중";
+        } else if (!status.healthy()) {
             healthColor = NamedTextColor.RED;
             heading = "저장소 오류";
         } else if (!status.ready()) {
@@ -160,7 +163,9 @@ public final class HistoryUi {
             .append(Component.text(
                 "준비 " + yesNo(status.ready())
                     + " · 기록 수락 " + yesNo(status.accepting())
-                    + " · DB 대기 " + status.databaseQueued()
+                    + " · 메모리 대기 " + status.volatileQueued()
+                    + " · 내구 저널/DB 대기 " + status.databaseQueued()
+                    + " / " + formatBytes(status.durableJournalBytes())
                     + " · 미확정 외부 편집 " + status.pendingReservations()
                     + " / " + status.pendingReservationChanges() + "변경",
                 NamedTextColor.GRAY

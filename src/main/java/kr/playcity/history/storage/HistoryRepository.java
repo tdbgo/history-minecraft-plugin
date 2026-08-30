@@ -20,6 +20,11 @@ interface HistoryRepository {
 
     void insertBatch(List<ChangeRecord> changes);
 
+    /** Inserts a replayed durable batch without duplicating an already committed capture. */
+    default void insertBatchIdempotent(List<ChangeRecord> changes) {
+        insertBatch(changes);
+    }
+
     List<ChangeRecord> query(HistoryQuery query);
 
     default void scanRollbackChanges(HistoryQuery query, ChangeRecordSink sink) {

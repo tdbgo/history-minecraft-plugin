@@ -14,7 +14,8 @@ public record ChangeRecord(
     BlockSnapshot after,
     UUID operationId,
     UUID batchId,
-    String metadata
+    String metadata,
+    UUID captureId
 ) {
     public ChangeRecord {
         position = Objects.requireNonNull(position, "position");
@@ -39,7 +40,29 @@ public record ChangeRecord(
         UUID operationId,
         String metadata
     ) {
-        this(id, occurredAt, position, actor, cause, before, after, operationId, null, metadata);
+        this(
+            id, occurredAt, position, actor, cause, before, after, operationId, null, metadata,
+            id == 0L ? UUID.randomUUID() : null
+        );
+    }
+
+    /** Compatibility constructor for callers that do not provide a durable capture identity. */
+    public ChangeRecord(
+        long id,
+        long occurredAt,
+        BlockPosition position,
+        ActorRef actor,
+        ChangeCause cause,
+        BlockSnapshot before,
+        BlockSnapshot after,
+        UUID operationId,
+        UUID batchId,
+        String metadata
+    ) {
+        this(
+            id, occurredAt, position, actor, cause, before, after, operationId, batchId, metadata,
+            id == 0L ? UUID.randomUUID() : null
+        );
     }
 
     public static ChangeRecord captured(
@@ -60,7 +83,8 @@ public record ChangeRecord(
             after,
             null,
             null,
-            metadata
+            metadata,
+            UUID.randomUUID()
         );
     }
 
@@ -83,7 +107,8 @@ public record ChangeRecord(
             after,
             null,
             batchId,
-            metadata
+            metadata,
+            UUID.randomUUID()
         );
     }
 
@@ -98,7 +123,8 @@ public record ChangeRecord(
             after,
             operationId,
             batchId,
-            metadata
+            metadata,
+            captureId
         );
     }
 }

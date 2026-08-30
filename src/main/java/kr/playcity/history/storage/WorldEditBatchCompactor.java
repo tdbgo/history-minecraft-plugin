@@ -115,7 +115,8 @@ final class WorldEditBatchCompactor {
                 latest.after(),
                 null,
                 latest.batchId(),
-                latest.metadata()
+                latest.metadata(),
+                latest.captureId()
             );
         }
 

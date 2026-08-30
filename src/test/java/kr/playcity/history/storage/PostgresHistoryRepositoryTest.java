@@ -145,6 +145,21 @@ class PostgresHistoryRepositoryTest {
     }
 
     @Test
+    void replayedCaptureIdentityIsInsertedExactlyOnce() throws Exception {
+        ChangeRecord original = change(
+            WORLD_ID, 300L, 12, "minecraft:stone", "minecraft:emerald_block"
+        );
+        repository.insertBatch(List.of(original));
+        repository.insertBatchIdempotent(List.of(original, original));
+
+        List<ChangeRecord> stored = repository.query(
+            HistoryQuery.at(WORLD_ID, 12, 64, 0, 0L, 10)
+        );
+        assertEquals(1, stored.size());
+        assertEquals("minecraft:emerald_block", stored.getFirst().after().blockData());
+    }
+
+    @Test
     void migratesVersionOneReferenceCounts() throws Exception {
         repository.insertBatch(List.of(change(100L, 3, "minecraft:stone", "minecraft:dirt")));
         repository.close();
@@ -162,8 +177,35 @@ class PostgresHistoryRepositoryTest {
              Statement statement = connection.createStatement()) {
             statement.execute("SET search_path TO \"" + config.schema() + "\"");
             assertEquals(2L, scalar(statement, "SELECT SUM(reference_count) FROM block_states"));
-            assertEquals(3L, scalar(statement, "SELECT version FROM schema_info"));
+            assertEquals(4L, scalar(statement, "SELECT version FROM schema_info"));
             assertEquals(1L, scalar(statement, "SELECT SUM(change_count) FROM storage_metrics"));
+        }
+    }
+
+    @Test
+    void migratesVersionThreeCaptureIdentityIdempotently() throws Exception {
+        repository.close();
+        try (Connection connection = inspectionConnection();
+             Statement statement = connection.createStatement()) {
+            statement.execute("SET search_path TO \"" + config.schema() + "\"");
+            statement.executeUpdate("DROP INDEX IF EXISTS changes_capture_uuid");
+            statement.executeUpdate("ALTER TABLE changes DROP COLUMN IF EXISTS capture_uuid");
+            statement.executeUpdate("UPDATE schema_info SET version = 3 WHERE singleton");
+        }
+
+        repository = new PostgresHistoryRepository(config);
+        repository.open();
+        ChangeRecord replayed = change(
+            WORLD_ID, 400L, 14, "minecraft:stone", "minecraft:diamond_block"
+        );
+        repository.insertBatchIdempotent(List.of(replayed, replayed));
+
+        try (Connection connection = inspectionConnection();
+             Statement statement = connection.createStatement()) {
+            statement.execute("SET search_path TO \"" + config.schema() + "\"");
+            assertEquals(4L, scalar(statement, "SELECT version FROM schema_info"));
+            assertEquals(1L, scalar(statement, "SELECT COUNT(*) FROM changes"));
+            assertEquals(1L, scalar(statement, "SELECT COUNT(capture_uuid) FROM changes"));
         }
     }
 

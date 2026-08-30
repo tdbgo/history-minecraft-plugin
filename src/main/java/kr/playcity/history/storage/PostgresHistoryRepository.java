@@ -43,7 +43,7 @@ import java.util.Set;
 import java.util.UUID;
 
 final class PostgresHistoryRepository implements HistoryRepository {
-    private static final int SCHEMA_VERSION = 3;
+    private static final int SCHEMA_VERSION = 4;
     private static final int STATE_CACHE_SIZE = 16_384;
     private static final int ACTOR_CACHE_SIZE = 4_096;
     private static final int LATEST_POSITION_BATCH_SIZE = 5_000;
@@ -123,6 +123,7 @@ final class PostgresHistoryRepository implements HistoryRepository {
                 );
             }
             createSchema();
+            createCaptureIdentitySchema();
             if (version == null) {
                 try (PreparedStatement statement = connection.prepareStatement(
                     "INSERT INTO schema_info(singleton, version) VALUES (TRUE, ?)"
@@ -130,7 +131,7 @@ final class PostgresHistoryRepository implements HistoryRepository {
                     statement.setInt(1, SCHEMA_VERSION);
                     statement.executeUpdate();
                 }
-            } else if (version == 1 || version == 2) {
+            } else if (version == 1 || version == 2 || version == 3) {
                 if (version == 1) {
                     migrateV1ToV2();
                 }
@@ -265,6 +266,16 @@ final class PostgresHistoryRepository implements HistoryRepository {
         }
     }
 
+    private void createCaptureIdentitySchema() throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("ALTER TABLE changes ADD COLUMN IF NOT EXISTS capture_uuid UUID");
+            statement.executeUpdate(
+                "CREATE UNIQUE INDEX IF NOT EXISTS changes_capture_uuid "
+                    + "ON changes(capture_uuid) WHERE capture_uuid IS NOT NULL"
+            );
+        }
+    }
+
     private void migrateV1ToV2() throws SQLException {
         try (Statement statement = connection.createStatement()) {
             statement.executeUpdate(
@@ -321,6 +332,48 @@ final class PostgresHistoryRepository implements HistoryRepository {
         } catch (SQLException exception) {
             throw storageFailure("Unable to persist a History change batch to PostgreSQL", exception);
         }
+    }
+
+    @Override
+    public void insertBatchIdempotent(List<ChangeRecord> changes) {
+        ensureConnected();
+        List<ChangeRecord> unseen = filterUnseenCaptures(changes);
+        if (!unseen.isEmpty()) {
+            insertBatch(unseen);
+        }
+    }
+
+    private List<ChangeRecord> filterUnseenCaptures(List<ChangeRecord> changes) {
+        Set<UUID> existing = new HashSet<>();
+        List<UUID> identities = changes.stream()
+            .map(ChangeRecord::captureId)
+            .filter(Objects::nonNull)
+            .distinct()
+            .toList();
+        try {
+            for (int start = 0; start < identities.size(); start += 1_000) {
+                List<UUID> page = identities.subList(start, Math.min(identities.size(), start + 1_000));
+                String placeholders = String.join(",", java.util.Collections.nCopies(page.size(), "?"));
+                try (PreparedStatement select = connection.prepareStatement(
+                    "SELECT capture_uuid FROM changes WHERE capture_uuid IN (" + placeholders + ")"
+                )) {
+                    for (int index = 0; index < page.size(); index++) {
+                        select.setObject(index + 1, page.get(index));
+                    }
+                    try (ResultSet result = select.executeQuery()) {
+                        while (result.next()) {
+                            existing.add(result.getObject(1, UUID.class));
+                        }
+                    }
+                }
+            }
+        } catch (SQLException exception) {
+            throw storageFailure("Unable to de-duplicate a replayed History batch", exception);
+        }
+        Set<UUID> selected = new HashSet<>(existing);
+        return changes.stream()
+            .filter(change -> change.captureId() == null || selected.add(change.captureId()))
+            .toList();
     }
 
     @Override
@@ -1359,8 +1412,8 @@ final class PostgresHistoryRepository implements HistoryRepository {
             INSERT INTO changes(
                 occurred_at, world_id, chunk_x, chunk_z, packed_position,
                 actor_id, cause, before_state_id, after_state_id,
-                operation_uuid, batch_id, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                operation_uuid, batch_id, metadata, capture_uuid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
     }
 
@@ -1388,7 +1441,8 @@ final class PostgresHistoryRepository implements HistoryRepository {
         statement.setLong(parameter++, afterStateId);
         setNullableUuid(statement, parameter++, change.operationId());
         setNullableBatchId(statement, parameter++, change.batchId());
-        setNullableText(statement, parameter, change.metadata());
+        setNullableText(statement, parameter++, change.metadata());
+        setNullableUuid(statement, parameter, change.captureId());
         return new StateIdPair(beforeStateId, afterStateId);
     }
 

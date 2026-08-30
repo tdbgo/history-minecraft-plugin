@@ -14,7 +14,7 @@ This alpha supports SQLite and PostgreSQL. It can capture compatible WorldEdit a
 
 ## Installation
 
-1. Build or download `History-0.4.0-alpha.7.jar`.
+1. Build or download `History-0.4.0-alpha.8.jar`.
 2. Copy it into the server's `plugins` directory.
 3. Restart Paper normally. Do not hot-reload the plugin.
 4. Run `/history status` and confirm that storage is ready.
@@ -51,6 +51,9 @@ If an operation remains `PREPARED` after an interruption, run `/history recover 
 - Each target is checked again before it is changed.
 - Recovery does not call WorldEdit or FAWE undo APIs.
 - Database work runs outside the server thread.
+- Accepted captures drain to a CRC-verified local journal before database projection.
+- Unacknowledged journal frames replay idempotently after a restart.
+- Database startup failures retry automatically while the healthy local journal keeps accepting captures.
 
 ## Current limits
 
@@ -59,6 +62,7 @@ If an operation remains `PREPARED` after an interruption, run `/history recover 
 - Entity events are audit records only. Entity restoration, biome restoration, and CoreProtect import are not implemented.
 - Folia is not supported.
 - Rollback planning has no configured total record or chunk cap. It streams matching history to disk and restores one exact chunk at a time.
+- Paper event capture remains non-blocking. A forced host failure can still lose the small in-memory tail that had not reached the forced local journal; History never hides a detected journal truncation or capture gap.
 
 See [storage guidance](docs/STORAGE.md) for backend selection and capacity planning. The [independent implementation record](docs/INDEPENDENT_IMPLEMENTATION.md) describes the integration boundary.
 
