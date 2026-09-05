@@ -89,6 +89,7 @@ final class PostgresHistoryRepository implements HistoryRepository {
             try (Statement statement = connection.createStatement()) {
                 statement.execute("CREATE SCHEMA IF NOT EXISTS " + quotedSchema());
                 statement.execute("SET search_path TO " + quotedSchema());
+                statement.execute("SET synchronous_commit = on");
             }
             migrate();
         } catch (ClassNotFoundException | SQLException exception) {

@@ -1,7 +1,10 @@
 package kr.playcity.history.integration.worldedit;
 
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Bounded duplicate-callback guard for post-application FAWE capture.
@@ -12,6 +15,7 @@ import java.util.Map;
  */
 final class FaweChunkAdmission {
     private static final int MAXIMUM_RECENT_CHUNKS = 8_192;
+    private final ReferenceQueue<Object> collectedCallbacks = new ReferenceQueue<>();
     private final Map<CallbackKey, Boolean> completed = new LinkedHashMap<>(256, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<CallbackKey, Boolean> eldest) {
@@ -20,7 +24,12 @@ final class FaweChunkAdmission {
     };
 
     synchronized boolean beginPost(long chunkKey, Object callbackIdentity) {
-        return completed.putIfAbsent(new CallbackKey(chunkKey, callbackIdentity), Boolean.TRUE) == null;
+        CallbackKey expired;
+        while ((expired = (CallbackKey) collectedCallbacks.poll()) != null) {
+            completed.remove(expired);
+        }
+        return completed.putIfAbsent(new CallbackKey(chunkKey,
+            Objects.requireNonNull(callbackIdentity, "callbackIdentity"), collectedCallbacks), Boolean.TRUE) == null;
     }
 
     synchronized void releaseAll() {
@@ -31,26 +40,28 @@ final class FaweChunkAdmission {
         return 0;
     }
 
-    private static final class CallbackKey {
+    private static final class CallbackKey extends WeakReference<Object> {
         private final long chunkKey;
-        private final Object callbackIdentity;
+        private final int identityHash;
 
-        private CallbackKey(long chunkKey, Object callbackIdentity) {
+        private CallbackKey(long chunkKey, Object callbackIdentity, ReferenceQueue<Object> queue) {
+            super(callbackIdentity, queue);
             this.chunkKey = chunkKey;
-            this.callbackIdentity = callbackIdentity;
+            this.identityHash = System.identityHashCode(callbackIdentity);
         }
 
         @Override
         public boolean equals(Object value) {
+            Object callback = get();
             return this == value
                 || value instanceof CallbackKey other
                     && chunkKey == other.chunkKey
-                    && callbackIdentity == other.callbackIdentity;
+                    && callback != null && callback == other.get();
         }
 
         @Override
         public int hashCode() {
-            return 31 * Long.hashCode(chunkKey) + System.identityHashCode(callbackIdentity);
+            return 31 * Long.hashCode(chunkKey) + identityHash;
         }
     }
 }

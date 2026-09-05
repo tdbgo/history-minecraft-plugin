@@ -14,7 +14,7 @@ This alpha supports SQLite and PostgreSQL. It can capture compatible WorldEdit a
 
 ## Installation
 
-1. Build or download `History-0.4.0-alpha.8.jar`.
+1. Build or download `History-0.4.0-alpha.9.jar`.
 2. Copy it into the server's `plugins` directory.
 3. Restart Paper normally. Do not hot-reload the plugin.
 4. Run `/history status` and confirm that storage is ready.
@@ -53,6 +53,7 @@ If an operation remains `PREPARED` after an interruption, run `/history recover 
 - Database work runs outside the server thread.
 - Accepted captures drain to a CRC-verified local journal before database projection.
 - Unacknowledged journal frames replay idempotently after a restart.
+- Direct and FAWE captures share an admission order while retaining separate queue capacity.
 - Database startup failures retry automatically while the healthy local journal keeps accepting captures.
 
 ## Current limits

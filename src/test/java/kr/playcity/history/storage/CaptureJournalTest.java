@@ -79,7 +79,7 @@ class CaptureJournalTest {
         Path file = temporaryDirectory.resolve("uncertain-commit.wal");
         try (CaptureJournal journal = new CaptureJournal(file)) {
             journal.open();
-            journal.append(List.of(change(5)));
+            journal.append(List.of(change(5), change(6), change(7)));
             CaptureJournal.JournalBatch firstAttempt = journal.readBatch(10);
             assertFalse(firstAttempt.replayed());
 
@@ -87,8 +87,68 @@ class CaptureJournalTest {
             CaptureJournal.JournalBatch retry = journal.readBatch(10);
             assertTrue(retry.replayed());
             assertEquals(firstAttempt.changes(), retry.changes());
+            assertFalse(retry.recovered());
             journal.acknowledge(retry);
             assertEquals(0L, journal.pendingCount());
+        }
+    }
+
+    @Test
+    void checkpointFailureCannotTruncateTheJournalOrForgetAnUnacknowledgedBatch() throws Exception {
+        Path file = temporaryDirectory.resolve("checkpoint-failure.wal");
+        Path temporaryCheckpoint = file.resolveSibling(file.getFileName() + ".checkpoint.tmp");
+        try (CaptureJournal journal = new CaptureJournal(file)) {
+            journal.open();
+            journal.append(List.of(change(1), change(2)));
+            journal.acknowledge(journal.readBatch(1));
+            CaptureJournal.JournalBatch last = journal.readBatch(1);
+            long length = Files.size(file);
+            Files.createDirectory(temporaryCheckpoint);
+            assertThrows(StorageException.class, () -> journal.acknowledge(last));
+            assertEquals(length, Files.size(file));
+            assertEquals(1L, journal.pendingCount());
+            assertThrows(StorageException.class, () -> journal.append(List.of(change(3))));
+            Files.delete(temporaryCheckpoint);
+            journal.requireIdempotentRetry(last);
+            journal.acknowledge(journal.readBatch(1));
+            journal.append(List.of(change(3), change(4)));
+        }
+        try (CaptureJournal reopened = new CaptureJournal(file)) {
+            reopened.open();
+            assertEquals(2L, reopened.pendingCount());
+            assertEquals(3, reopened.readBatch(10).changes().getFirst().position().x());
+        }
+    }
+
+    @Test
+    void staleAcknowledgementCannotConsumeNewRecordsAtReusedOffsets() {
+        try (CaptureJournal journal = new CaptureJournal(temporaryDirectory.resolve("stale-ack.wal"))) {
+            journal.open();
+            journal.append(List.of(change(1)));
+            CaptureJournal.JournalBatch first = journal.readBatch(1);
+            journal.acknowledge(first);
+            journal.append(List.of(change(2)));
+            CaptureJournal.JournalBatch next = journal.readBatch(1);
+            assertThrows(StorageException.class, () -> journal.acknowledge(first));
+            assertThrows(StorageException.class, () -> journal.requireIdempotentRetry(first));
+            assertEquals(1L, journal.pendingCount());
+            journal.acknowledge(next);
+        }
+    }
+
+    @Test
+    void retriesDoNotAbsorbNewAppendsIntoAnUncertainBatch() {
+        try (CaptureJournal journal = new CaptureJournal(temporaryDirectory.resolve("retry-boundary.wal"))) {
+            journal.open();
+            journal.append(List.of(change(1), change(2)));
+            CaptureJournal.JournalBatch original = journal.readBatch(10);
+            journal.append(List.of(change(3)));
+            journal.requireIdempotentRetry(original);
+            CaptureJournal.JournalBatch retry = journal.readBatch(10);
+            assertEquals(original.changes(), retry.changes());
+            journal.acknowledge(retry);
+            assertEquals(List.of(change(3).position()), journal.readBatch(10).changes().stream()
+                .map(ChangeRecord::position).toList());
         }
     }
 
@@ -109,6 +169,27 @@ class CaptureJournalTest {
 
         CaptureJournal corrupted = new CaptureJournal(file);
         assertThrows(StorageException.class, corrupted::open);
+    }
+
+    @Test
+    void boundsLargePayloadBatchesByBytesAsWellAsRecordCount() {
+        try (CaptureJournal journal = new CaptureJournal(temporaryDirectory.resolve("payload-budget.wal"))) {
+            journal.open();
+            for (int index = 0; index < 20; index++) {
+                ChangeRecord source = change(index);
+                journal.append(List.of(new ChangeRecord(
+                    source.id(), source.occurredAt(), source.position(), source.actor(), source.cause(),
+                    source.before(), new BlockSnapshot("minecraft:chest", "inventory/v1", new byte[1_048_576]),
+                    source.operationId(), source.batchId(), source.metadata(), source.captureId()
+                )));
+            }
+            CaptureJournal.JournalBatch batch = journal.readBatch(8_192);
+            assertTrue(batch.changes().size() < 20);
+            assertTrue(batch.endOffset() - batch.startOffset() <= 16L * 1024 * 1024);
+            int firstCount = batch.changes().size();
+            journal.acknowledge(batch);
+            assertEquals(20 - firstCount, journal.readBatch(8_192).changes().size());
+        }
     }
 
     @Test

@@ -107,7 +107,7 @@ public record StoreStatus(
     }
 
     public boolean recoveryAvailable() {
-        return ready && accepting && healthy && degraded
+        return ready && healthy && degraded
             && volatileQueued == 0 && databaseQueued == 0
             && pendingReservations == 0 && pendingReservationChanges == 0L;
     }

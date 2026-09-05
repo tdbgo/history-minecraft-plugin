@@ -79,7 +79,7 @@ final class SqliteHistoryRepository implements HistoryRepository {
                 statement.execute("PRAGMA page_size=8192");
                 statement.execute("PRAGMA auto_vacuum=INCREMENTAL");
                 statement.execute("PRAGMA journal_mode=WAL");
-                statement.execute("PRAGMA synchronous=NORMAL");
+                statement.execute("PRAGMA synchronous=FULL");
                 statement.execute("PRAGMA temp_store=MEMORY");
                 statement.execute("PRAGMA cache_size=-32768");
                 statement.execute("PRAGMA mmap_size=268435456");

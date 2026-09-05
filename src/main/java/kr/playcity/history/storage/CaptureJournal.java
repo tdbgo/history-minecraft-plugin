@@ -39,6 +39,7 @@ final class CaptureJournal implements AutoCloseable {
     private static final int MAXIMUM_FRAME_BYTES = 64 * 1024 * 1024;
     private static final int MAXIMUM_STRING_BYTES = 4 * 1024 * 1024;
     private static final int MAXIMUM_PAYLOAD_BYTES = 48 * 1024 * 1024;
+    private static final int TARGET_BATCH_BYTES = 16 * 1024 * 1024;
 
     private final Path journalFile;
     private final Path checkpointFile;
@@ -46,6 +47,8 @@ final class CaptureJournal implements AutoCloseable {
     private long readOffset = HEADER_BYTES;
     private long replayUntil = HEADER_BYTES;
     private long idempotentRetryOffset = -1L;
+    private JournalBatch inFlight;
+    private boolean resetPending;
     private volatile long pendingCount;
     private volatile long backlogBytes;
     private volatile boolean truncatedTail;
@@ -85,10 +88,14 @@ final class CaptureJournal implements AutoCloseable {
             return;
         }
         requireOpen();
+        if (resetPending) {
+            throw new StorageException("History capture journal checkpoint reset must finish before appending");
+        }
         long originalLength = -1L;
         try {
             originalLength = channel.size();
             long writeOffset = originalLength;
+            ByteBuffer output = ByteBuffer.allocate(256 * 1024);
             for (ChangeRecord change : changes) {
                 if (change.captureId() == null) {
                     throw new StorageException("A journaled History change requires a capture identity");
@@ -96,16 +103,22 @@ final class CaptureJournal implements AutoCloseable {
                 byte[] payload = encode(change);
                 CRC32C crc = new CRC32C();
                 crc.update(payload, 0, payload.length);
-                ByteBuffer header = ByteBuffer.allocate(FRAME_HEADER_BYTES)
-                    .putInt(payload.length)
-                    .putInt((int) crc.getValue())
-                    .flip();
-                writeFully(header, writeOffset);
-                writeOffset += FRAME_HEADER_BYTES;
-                writeFully(ByteBuffer.wrap(payload), writeOffset);
-                writeOffset += payload.length;
+                if (output.remaining() < FRAME_HEADER_BYTES) {
+                    writeOffset = flushBuffer(output, writeOffset);
+                }
+                output.putInt(payload.length).putInt((int) crc.getValue());
+                int cursor = 0;
+                while (cursor < payload.length) {
+                    if (!output.hasRemaining()) {
+                        writeOffset = flushBuffer(output, writeOffset);
+                    }
+                    int amount = Math.min(output.remaining(), payload.length - cursor);
+                    output.put(payload, cursor, amount);
+                    cursor += amount;
+                }
             }
-            channel.force(false);
+            writeOffset = flushBuffer(output, writeOffset);
+            channel.force(true);
             pendingCount = Math.addExact(pendingCount, changes.size());
             backlogBytes = Math.max(0L, writeOffset - readOffset);
         } catch (IOException | RuntimeException failure) {
@@ -129,27 +142,36 @@ final class CaptureJournal implements AutoCloseable {
         }
         requireOpen();
         try {
+            if (inFlight != null) {
+                return inFlight;
+            }
             long length = channel.size();
             if (readOffset >= length) {
                 return JournalBatch.empty(readOffset);
             }
             long cursor = readOffset;
-            boolean replaying = readOffset < replayUntil || readOffset == idempotentRetryOffset;
+            boolean recovered = readOffset < replayUntil;
+            boolean replaying = recovered || readOffset == idempotentRetryOffset;
             List<ChangeRecord> changes = new ArrayList<>(Math.min(maximumRecords, 8_192));
             while (changes.size() < maximumRecords && cursor < length) {
                 Frame frame = readFrame(cursor, length, false);
+                if (!changes.isEmpty() && frame.endOffset() - readOffset > TARGET_BATCH_BYTES) {
+                    break;
+                }
                 changes.add(decode(frame.payload()));
                 cursor = frame.endOffset();
-                if (replaying && cursor >= replayUntil) {
+                if ((recovered && cursor >= replayUntil) || cursor - readOffset >= TARGET_BATCH_BYTES) {
                     break;
                 }
             }
-            return new JournalBatch(
+            inFlight = new JournalBatch(
                 List.copyOf(changes),
                 readOffset,
                 cursor,
-                replaying
+                replaying,
+                recovered
             );
+            return inFlight;
         } catch (IOException failure) {
             throw new StorageException("Unable to read the History capture journal", failure);
         }
@@ -160,32 +182,26 @@ final class CaptureJournal implements AutoCloseable {
         if (batch.changes().isEmpty()) {
             return;
         }
-        if (batch.startOffset() != readOffset || batch.endOffset() <= batch.startOffset()) {
+        if (batch != inFlight || batch.startOffset() != readOffset || batch.endOffset() <= batch.startOffset()) {
             throw new StorageException("History capture journal acknowledgement is out of order");
         }
         try {
             long length = channel.size();
             long remaining = Math.max(0L, pendingCount - batch.changes().size());
-            if (batch.endOffset() == length) {
+            if (resetPending || batch.endOffset() == length) {
+                // Reset the checkpoint durably before reusing offsets. A crash between
+                // these steps can replay old UUIDs, but can never skip new captures.
+                resetPending = true;
+                writeCheckpoint(HEADER_BYTES);
                 channel.truncate(HEADER_BYTES);
-                channel.force(false);
+                channel.force(true);
                 readOffset = HEADER_BYTES;
                 replayUntil = HEADER_BYTES;
                 backlogBytes = 0L;
                 pendingCount = remaining;
+                resetPending = false;
                 if (idempotentRetryOffset == batch.startOffset()) {
                     idempotentRetryOffset = -1L;
-                }
-                try {
-                    writeCheckpoint(HEADER_BYTES);
-                } catch (IOException checkpointFailure) {
-                    // The empty journal is authoritative. A missing, stale, or malformed checkpoint
-                    // safely falls back to the header during the next open.
-                    try {
-                        Files.deleteIfExists(checkpointFile);
-                    } catch (IOException deleteFailure) {
-                        checkpointFailure.addSuppressed(deleteFailure);
-                    }
                 }
             } else {
                 writeCheckpoint(batch.endOffset());
@@ -196,6 +212,7 @@ final class CaptureJournal implements AutoCloseable {
                     idempotentRetryOffset = -1L;
                 }
             }
+            inFlight = null;
         } catch (IOException failure) {
             throw new StorageException("Unable to checkpoint the History capture journal", failure);
         }
@@ -203,10 +220,11 @@ final class CaptureJournal implements AutoCloseable {
 
     synchronized void requireIdempotentRetry(JournalBatch batch) {
         requireOpen();
-        if (batch.startOffset() != readOffset) {
+        if (batch != inFlight || batch.startOffset() != readOffset) {
             throw new StorageException("History capture journal retry marker is out of order");
         }
         idempotentRetryOffset = readOffset;
+        inFlight = new JournalBatch(batch.changes(), batch.startOffset(), batch.endOffset(), true, batch.recovered());
     }
 
     long pendingCount() {
@@ -219,6 +237,16 @@ final class CaptureJournal implements AutoCloseable {
 
     boolean truncatedTail() {
         return truncatedTail;
+    }
+
+    synchronized void verifyWritable() {
+        requireOpen();
+        try {
+            channel.force(true);
+            writeCheckpoint(readOffset);
+        } catch (IOException failure) {
+            throw new StorageException("History capture journal is not writable", failure);
+        }
     }
 
     @Override
@@ -254,6 +282,10 @@ final class CaptureJournal implements AutoCloseable {
     }
 
     private void scanAndRecover() throws IOException {
+        inFlight = null;
+        resetPending = false;
+        idempotentRetryOffset = -1L;
+        truncatedTail = false;
         long length = channel.size();
         long requestedCheckpoint = readCheckpoint();
         long cursor = HEADER_BYTES;
@@ -372,7 +404,7 @@ final class CaptureJournal implements AutoCloseable {
             while (checkpoint.hasRemaining()) {
                 output.write(checkpoint);
             }
-            output.force(false);
+            output.force(true);
         }
         try {
             Files.move(
@@ -523,6 +555,14 @@ final class CaptureJournal implements AutoCloseable {
         }
     }
 
+    private long flushBuffer(ByteBuffer buffer, long offset) throws IOException {
+        int length = buffer.position();
+        buffer.flip();
+        writeFully(buffer, offset);
+        buffer.clear();
+        return offset + length;
+    }
+
     private void readFully(ByteBuffer target, long offset) throws IOException {
         long cursor = offset;
         while (target.hasRemaining()) {
@@ -558,10 +598,11 @@ final class CaptureJournal implements AutoCloseable {
         List<ChangeRecord> changes,
         long startOffset,
         long endOffset,
-        boolean replayed
+        boolean replayed,
+        boolean recovered
     ) {
         private static JournalBatch empty(long offset) {
-            return new JournalBatch(List.of(), offset, offset, false);
+            return new JournalBatch(List.of(), offset, offset, false, false);
         }
     }
 

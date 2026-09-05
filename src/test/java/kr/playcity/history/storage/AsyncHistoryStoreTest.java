@@ -186,7 +186,7 @@ class AsyncHistoryStoreTest {
     }
 
     @Test
-    void compactsOneWorldEditBatchBeforePersistenceWithoutChangingItsRollbackEndpoints() throws Exception {
+    void preservesIntermediateWorldEditStatesForStableReplayIdentities() throws Exception {
         UUID worldId = UUID.randomUUID();
         UUID actorId = UUID.randomUUID();
         UUID batchId = UUID.randomUUID();
@@ -215,13 +215,65 @@ class AsyncHistoryStoreTest {
                 HistoryQuery.at(worldId, 1, 64, 2, 0L, 10)
             ).get(5, TimeUnit.SECONDS);
 
-            assertEquals(1, changes.size());
-            assertEquals("minecraft:stone", changes.getFirst().before().blockData());
+            assertEquals(2, changes.size());
+            assertEquals("minecraft:dirt", changes.getFirst().before().blockData());
             assertEquals("minecraft:gold_block", changes.getFirst().after().blockData());
+            assertEquals("minecraft:stone", changes.getLast().before().blockData());
             assertEquals(2L, store.status().accepted());
-            assertEquals(1L, store.status().persisted());
-            assertEquals(1L, store.status().compacted());
+            assertEquals(2L, store.status().persisted());
+            assertEquals(0L, store.status().compacted());
         } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void preservesDirectAndFaweAdmissionOrderAtTheSameTimestamp() throws Exception {
+        TestRepository repository = new TestRepository(false, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(new HistoryConfig.Storage(
+            temporaryDirectory.resolve("mixed-order.db"), 1_000, 512, 30_000, 1_000
+        ), Logger.getAnonymousLogger(), repository);
+        ChangeRecord sample = change(0);
+        List<ChangeRecord> expected = new ArrayList<>();
+        UUID edit = UUID.randomUUID();
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            for (int index = 0; index < 100; index++) {
+                ChangeRecord next = new ChangeRecord(0, 100, sample.position(), sample.actor(),
+                    index % 2 == 0 ? ChangeCause.PLAYER_PLACE : ChangeCause.WORLD_EDIT,
+                    BlockSnapshot.block(index % 2 == 0 ? "minecraft:stone" : "minecraft:dirt"),
+                    BlockSnapshot.block(index % 2 == 0 ? "minecraft:dirt" : "minecraft:stone"),
+                    null, index % 2 == 0 ? null : edit, "");
+                expected.add(next);
+                assertTrue(index % 2 == 0 ? store.append(next) : store.tryAppendWorldEdit(next));
+            }
+            store.query(HistoryQuery.at(sample.position().worldId(), 0, 64, 2, 0, 100))
+                .get(3, TimeUnit.SECONDS);
+            assertEquals(expected, repository.writtenChanges);
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void resumeCannotReopenCaptureAfterShutdownBegins() throws Exception {
+        TestRepository repository = new TestRepository(false, 0);
+        AsyncHistoryStore store = new AsyncHistoryStore(new HistoryConfig.Storage(
+            temporaryDirectory.resolve("resume-close.db"), 32, 8, 20, 1_000
+        ), Logger.getAnonymousLogger(), repository);
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(2));
+            store.reportCaptureGap(1, "direct", "test gap");
+            repository.blockVerification.set(true);
+            CompletableFuture<CaptureRecoveryResult> resumed = store.resumeCapture();
+            assertTrue(repository.verificationStarted.await(2, TimeUnit.SECONDS));
+            CompletableFuture<Void> closed = store.closeAsync();
+            repository.releaseVerification.countDown();
+            assertFalse(resumed.get(3, TimeUnit.SECONDS).resumed());
+            closed.get(3, TimeUnit.SECONDS);
+            assertFalse(store.status().accepting());
+        } finally {
+            repository.releaseVerification.countDown();
             store.closeAsync().get(5, TimeUnit.SECONDS);
         }
     }
@@ -410,6 +462,64 @@ class AsyncHistoryStoreTest {
             assertEquals(0L, recovered.rejected());
             assertEquals("", recovered.lastError());
             assertEquals(2, repository.insertAttempts.get());
+            // A successful retry must also advance the read/rollback barrier.
+            store.query(HistoryQuery.at(change(0).position().worldId(), 0, 64, 2, 0L, 10))
+                .get(2, TimeUnit.SECONDS);
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void retriesTransientFailureDuringStartupReplay() throws Exception {
+        Path database = temporaryDirectory.resolve("replay-startup-failure.db");
+        try (CaptureJournal journal = new CaptureJournal(database.resolveSibling("capture-journal.wal"))) {
+            journal.open();
+            journal.append(List.of(change(0), change(1)));
+        }
+        TestRepository repository = new TestRepository(false, 1);
+        AsyncHistoryStore store = new AsyncHistoryStore(
+            new HistoryConfig.Storage(database, 32, 8, 20, 1_000), Logger.getAnonymousLogger(), repository
+        );
+        try {
+            await(() -> store.status().ready(), Duration.ofSeconds(3));
+            assertEquals(2L, store.status().persisted());
+            assertEquals(0, store.status().databaseQueued());
+            assertTrue(store.append(change(2)));
+            store.query(HistoryQuery.at(change(2).position().worldId(), 2, 64, 2, 0L, 10))
+                .get(2, TimeUnit.SECONDS);
+            assertEquals(3L, store.status().persisted());
+        } finally {
+            store.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void replayWithDifferentBatchBoundariesPreservesIntermediateStates() throws Exception {
+        Path database = temporaryDirectory.resolve("replay-regrouped.db");
+        ChangeRecord first = change(10);
+        UUID edit = UUID.randomUUID();
+        first = new ChangeRecord(0, 100, first.position(), first.actor(), ChangeCause.WORLD_EDIT,
+            BlockSnapshot.air(), BlockSnapshot.block("minecraft:stone"), null, edit, "");
+        ChangeRecord second = new ChangeRecord(0, 101, first.position(), first.actor(), ChangeCause.WORLD_EDIT,
+            first.after(), BlockSnapshot.block("minecraft:dirt"), null, edit, "");
+        SqliteHistoryRepository repository = new SqliteHistoryRepository(database, 1_000);
+        repository.open();
+        repository.insertBatch(List.of(first));
+        repository.close();
+        try (CaptureJournal journal = new CaptureJournal(database.resolveSibling("capture-journal.wal"))) {
+            journal.open();
+            journal.append(List.of(first, second));
+        }
+        AsyncHistoryStore store = new AsyncHistoryStore(
+            new HistoryConfig.Storage(database, 32, 8, 20, 1_000), Logger.getAnonymousLogger()
+        );
+        try {
+            List<ChangeRecord> result = store.query(HistoryQuery.at(first.position().worldId(), 10, 64, 2, 0L, 10))
+                .get(3, TimeUnit.SECONDS);
+            assertEquals(2, result.size());
+            assertEquals("minecraft:stone", result.getFirst().before().blockData());
+            assertEquals("minecraft:dirt", result.getFirst().after().blockData());
         } finally {
             store.closeAsync().get(5, TimeUnit.SECONDS);
         }
@@ -994,6 +1104,7 @@ class AsyncHistoryStoreTest {
         private final AtomicInteger operationAttempts = new AtomicInteger();
         private final AtomicInteger closeAttempts = new AtomicInteger();
         private final List<Integer> batchSizes = new ArrayList<>();
+        private final List<ChangeRecord> writtenChanges = new ArrayList<>();
         private final boolean blockOpen;
         private final AtomicBoolean failOpen;
         private final boolean blockQuery;
@@ -1001,6 +1112,9 @@ class AsyncHistoryStoreTest {
         private final CountDownLatch releaseOpen = new CountDownLatch(1);
         private final CountDownLatch queryStarted = new CountDownLatch(1);
         private final CountDownLatch releaseQuery = new CountDownLatch(1);
+        private final AtomicBoolean blockVerification = new AtomicBoolean();
+        private final CountDownLatch verificationStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseVerification = new CountDownLatch(1);
 
         private TestRepository(boolean blockFirstInsert, int failures) {
             this(blockFirstInsert, failures, false, false, false);
@@ -1067,6 +1181,7 @@ class AsyncHistoryStoreTest {
                 batchSizes.add(changes.size());
             }
             persisted.addAndGet(changes.size());
+            writtenChanges.addAll(changes);
         }
 
         @Override
@@ -1120,6 +1235,17 @@ class AsyncHistoryStoreTest {
 
         @Override
         public int interruptedOperationCount() {
+            if (blockVerification.get()) {
+                verificationStarted.countDown();
+                try {
+                    if (!releaseVerification.await(5, TimeUnit.SECONDS)) {
+                        throw new StorageException("test verification was not released");
+                    }
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    throw new StorageException("test verification was interrupted", failure);
+                }
+            }
             return 0;
         }
 

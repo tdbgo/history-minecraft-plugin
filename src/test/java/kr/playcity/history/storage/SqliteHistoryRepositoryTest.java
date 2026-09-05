@@ -132,6 +132,16 @@ class SqliteHistoryRepositoryTest {
     }
 
     @Test
+    void writerForcesWalCommitsBeforeJournalAcknowledgement() throws Exception {
+        var field = SqliteHistoryRepository.class.getDeclaredField("connection");
+        field.setAccessible(true);
+        Connection writer = (Connection) field.get(repository);
+        try (Statement statement = writer.createStatement()) {
+            assertEquals(2L, scalar(statement, "PRAGMA synchronous"));
+        }
+    }
+
+    @Test
     void keysetCursorReturnsEveryRecordWithoutDuplicatesAtEqualTimestamps() {
         List<ChangeRecord> inserted = new ArrayList<>();
         for (int index = 0; index < 5; index++) {

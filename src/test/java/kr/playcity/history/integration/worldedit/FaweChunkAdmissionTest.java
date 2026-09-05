@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.lang.ref.WeakReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -89,6 +90,26 @@ class FaweChunkAdmissionTest {
 
         assertTrue(admission.beginPost(12L, callback));
         assertEquals(0, admission.pendingCount());
+    }
+
+    @Test
+    void completedChunkPayloadCanBeCollectedWhileTheEditSessionStaysAlive() throws Exception {
+        FaweChunkAdmission admission = new FaweChunkAdmission();
+        WeakReference<Object> payload = registerTemporaryChunk(admission);
+        for (int attempt = 0; attempt < 30 && payload.get() != null; attempt++) {
+            System.gc();
+            Thread.sleep(10L);
+        }
+        assertEquals(null, payload.get(), "Duplicate guard retained a completed chunk payload");
+        Object next = new Object();
+        assertTrue(admission.beginPost(10L, next));
+        assertFalse(admission.beginPost(10L, next));
+    }
+
+    private static WeakReference<Object> registerTemporaryChunk(FaweChunkAdmission admission) {
+        Object chunk = new byte[1_048_576];
+        assertTrue(admission.beginPost(10L, chunk));
+        return new WeakReference<>(chunk);
     }
 
     private static void await(CountDownLatch latch) {

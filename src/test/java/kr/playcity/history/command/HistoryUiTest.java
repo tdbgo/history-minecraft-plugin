@@ -10,7 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class HistoryUiTest {
     @Test
     void haltedCaptureCannotBeDisplayedAsNormal() {
-        String text = render(new StoreStatus(
+        StoreStatus status = new StoreStatus(
             "SQLite",
             true,
             false,
@@ -25,10 +25,12 @@ class HistoryUiTest {
             0,
             0,
             "queue overflow"
-        ));
+        );
+        String text = render(status);
 
         assertTrue(text.contains("기록 중단 · SQLite"));
         assertFalse(text.contains("정상 · SQLite"));
+        assertTrue(status.recoveryAvailable());
     }
 
     @Test

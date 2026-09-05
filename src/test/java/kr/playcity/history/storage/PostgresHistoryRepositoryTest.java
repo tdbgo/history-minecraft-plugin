@@ -160,6 +160,39 @@ class PostgresHistoryRepositoryTest {
     }
 
     @Test
+    void reconnectsAfterServerClosesWriterWithoutDuplicatingCapturedChanges() throws Exception {
+        var field = PostgresHistoryRepository.class.getDeclaredField("connection");
+        field.setAccessible(true);
+        Connection writer = (Connection) field.get(repository);
+        long pid;
+        try (Statement statement = writer.createStatement()) {
+            pid = scalar(statement, "SELECT pg_backend_pid()");
+            try (ResultSet mode = statement.executeQuery("SHOW synchronous_commit")) {
+                assertTrue(mode.next());
+                assertEquals("on", mode.getString(1));
+            }
+        }
+        ChangeRecord first = change(100, 1, "minecraft:stone", "minecraft:dirt");
+        ChangeRecord second = change(200, 2, "minecraft:stone", "minecraft:gold_block");
+        repository.insertBatch(List.of(first));
+        try (Connection inspection = inspectionConnection(); Statement statement = inspection.createStatement()) {
+            statement.execute("SELECT pg_terminate_backend(" + pid + ")");
+        }
+        boolean restored = false;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                repository.insertBatchIdempotent(List.of(first, second));
+                restored = true;
+                break;
+            } catch (StorageException expectedDisconnect) {
+                // The first request discovers the closed server connection.
+            }
+        }
+        assertTrue(restored);
+        assertEquals(2, repository.query(HistoryQuery.nearby(WORLD_ID, 1, 0, 10, 0, null, 10)).size());
+    }
+
+    @Test
     void migratesVersionOneReferenceCounts() throws Exception {
         repository.insertBatch(List.of(change(100L, 3, "minecraft:stone", "minecraft:dirt")));
         repository.close();

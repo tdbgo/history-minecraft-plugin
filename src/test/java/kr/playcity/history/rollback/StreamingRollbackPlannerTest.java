@@ -94,8 +94,8 @@ class StreamingRollbackPlannerTest {
     }
 
     @Test
-    void keepsOneHotCoordinateMemoryBoundedAcrossHundredsOfThousandsOfChanges() {
-        int changes = 250_001;
+    void keepsOneHotCoordinateMemoryBoundedAcrossOneMillionChanges() {
+        int changes = 1_000_001;
         OperationPlanSpool.Writer writer = OperationPlanSpool.create(
             OperationPlanSpool.prepareDirectory(temporaryDirectory)
         );
